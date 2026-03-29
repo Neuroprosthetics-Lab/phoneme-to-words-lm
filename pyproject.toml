@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phoneme_to_words_lm"
+version = "0.1.0"
+description = "KenLM/flashlight-text phoneme-to-words decoder with optional LLM rescoring"
+requires-python = ">=3.10"
+# Dependencies are installed via env_setup.sh, not pip resolution,
+# because flashlight-text requires a patched source build and
+# PyTorch needs a specific CUDA index URL.
+dependencies = []
+
+[tool.setuptools.package-data]
+phoneme_to_words_lm = ["cmu_dict.pkl"]

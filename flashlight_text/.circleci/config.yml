@@ -1,0 +1,566 @@
+version: 2.1
+
+macos_env: &macos_env
+  macos:
+    xcode: 14.2.0
+  environment:
+    HOMEBREW_NO_AUTO_UPDATE: "1"
+
+linux_env: &linux_env
+  machine:
+    image: ubuntu-2204:current
+
+orbs:
+  win: circleci/windows@5.0.0
+
+commands:
+  install_ubuntu_build_dependencies:
+    parameters:
+      use_kenlm:
+        type: string
+    steps:
+      - run:
+          name: "Install Build Dependencies"
+          command: |
+            sudo apt -y update && \
+            sudo apt -y install build-essential python3-dev python3-pip python3-venv cmake
+      - when:
+          condition:
+            equal: ["ON", << parameters.use_kenlm >>]
+          steps:
+            - run:
+                name: "Install Build Dependencies (KenLM)"
+                # TODO: remove boost once https://github.com/kpu/kenlm/pull/418 is merged
+                command: |
+                  sudo apt -y install libboost-program-options-dev libboost-system-dev libboost-thread-dev \
+                  libboost-test-dev liblzma-dev libbz2-dev zlib1g-dev
+  install_macos_build_dependencies:
+    parameters:
+      use_kenlm:
+        type: string
+    steps:
+      - run:
+          name: "Install Build Dependencies"
+          command: brew install googletest cmake
+      - when:
+          condition:
+            equal: ["ON", << parameters.use_kenlm >>]
+          steps:
+            - run:
+                name: "Install Build Dependencies (KenLM)"
+                # TODO: remove boost once https://github.com/kpu/kenlm/pull/418 is merged
+                command: brew install boost zlib bzip2 lzip
+  install_msvc_build_dependencies:
+    parameters:
+      use_kenlm:
+        type: string
+    steps:
+      - run:
+          name: "Install Build Dependencies"
+          command: |
+            choco install python3 cmake -y
+      - run:
+          name: "Install Build Dependencies"
+          command: choco install cmake -y
+      # windows needs a path modification
+      - run:
+          name: "Set PATH to find CMake"
+          command: echo 'export PATH="$PATH:/c/Program Files/CMake/bin"' >> $BASH_ENV
+  install_kenlm:
+    parameters:
+      platform:
+        type: string
+        default: "linux"
+    steps:
+      - run:
+          name: "Install KenLM"
+          command: |
+            git clone https://github.com/kpu/kenlm.git && cd kenlm
+            mkdir build
+            cmake -S . -B build -DBUILD_SHARED_LIBS=ON && \
+            cmake --build build --parallel && sudo cmake --install build
+      - when:
+          condition:
+            equal: ["linux", << parameters.platform >>]
+          steps:
+            - run:
+                name: "Configure shared lib paths"
+                command: sudo ldconfig
+  build_flashlight_text:
+    parameters:
+      use_kenlm:
+        type: string
+        default: "ON"
+      build_shared_libs:
+        type: string
+        default: "OFF"
+      build_standalone:
+        type: string
+        default: "ON"
+      build_code_coverage:
+        type: string
+        default: "OFF"
+      platform:
+        type: string
+        default: "linux"
+    steps:
+      - run:
+          name: "Build and Install Flashlight Text"
+          command: |
+            mkdir build && \
+            cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+              -DBUILD_SHARED_LIBS=<< parameters.build_shared_libs >> \
+              -DFL_TEXT_USE_KENLM=<< parameters.use_kenlm >> \
+              -DFL_TEXT_BUILD_STANDALONE=<< parameters.build_standalone >> \
+              -DFL_TEXT_CODE_COVERAGE=<< parameters.build_code_coverage >>
+            cmake --build build --parallel
+      # only test install with non-Windows platforms (TODO: fix this)
+      - when:
+          condition:
+            not:
+              equal: ["windows", << parameters.platform >>]
+          steps:
+            - run:
+                name: "Run Install Step"
+                command: sudo cmake --install build
+      # linux needs ldconfig
+      - when:
+          condition:
+            equal: ["linux", << parameters.platform >>]
+          steps:
+            - run:
+                name: "Configure shared lib paths"
+                command: sudo ldconfig
+  setup_python_virtualenv:
+    parameters:
+      platform:
+        type: string
+    steps:
+      - when:
+          condition:
+            or:
+              - equal: ["linux", << parameters.platform >>]
+              - equal: ["macos", << parameters.platform >>]
+          steps:
+            - run:
+                name: "Setup virtualenv"
+                command: |
+                  python3 -m venv venv
+                  echo "source venv/bin/activate" >> $BASH_ENV
+      - when:
+          condition:
+            equal: ["windows", << parameters.platform >>]
+          steps:
+            - run:
+                name: "Setup virtualenv"
+                command: |
+                  python -m venv venv
+                  echo "source venv/Scripts/activate" >> $BASH_ENV
+  install_python_bindings:
+    parameters:
+      use_kenlm:
+        type: string
+        default: "ON"
+    steps:
+      - when:
+          condition:
+            equal: ["ON", << parameters.use_kenlm >>]
+          steps:
+            - run:
+                name: "Install KenLM"
+                command: |
+                  pip install -v git+https://github.com/kpu/kenlm.git
+      - run:
+          name: "Install Python bindings build dependencies"
+          command: |
+            pip install setuptools wheel
+      - run:
+          name: "Install Python Bindings"
+          # Because of KenLM, use --no-build-isolation
+          command: |
+            USE_KENLM=<< parameters.use_kenlm >> pip install -v . --no-build-isolation
+  run_python_tests:
+    parameters:
+      use_kenlm:
+        type: string
+        default: "ON"
+    steps:
+      - run:
+          name: "Install test dependencies"
+          command: |
+            pip install -r bindings/python/test/requirements.txt
+      - run:
+          name: "Run Python Binding Tests"
+          command: |
+            cd bindings/python/test && \
+            USE_KENLM=<< parameters.use_kenlm >> python -m unittest discover -v .
+  test_with_external_project:
+    parameters:
+      build_shared_libs:
+        type: string
+        default: "OFF"
+    steps:
+      - run:
+          name: Set up dependent external project
+          command: |
+            mkdir -p test_project && cd test_project && \
+            echo -e "\
+              #include <flashlight/lib/text/dictionary/Dictionary.h> \n
+              #if USE_KENLM                                          \n
+              #include <flashlight/lib/text/decoder/lm/KenLM.h>      \n
+              #endif                                                 \n
+              #include <iostream>                                    \n
+              int main() {                                           \n
+                fl::lib::text::Dictionary myDict;                    \n
+                myDict.addEntry(\"A\", 1);                           \n
+                myDict.addEntry(\"B\", 2);                           \n
+                #if USE_KENLM                                        \n
+                fl::lib::text::KenLM kenlm("/tmp/foo.lm", myDict);   \n
+                #endif                                               \n
+                return 0;                                            \n
+              }                                                      \n
+            " > main.cpp && \
+            echo -e "\
+              cmake_minimum_required(VERSION 3.16)                                            \n
+              project(test_project)                                                           \n
+              set(CMAKE_CXX_STANDARD 17)                                                      \n
+              set(CMAKE_CXX_STANDARD_REQUIRED ON)                                             \n
+              add_executable(main main.cpp)                                                   \n
+              find_package(flashlight-text CONFIG REQUIRED)                                   \n
+              target_link_libraries(main PRIVATE flashlight::flashlight-text)                 \n
+              if (FL_TEXT_USE_KENLM)                                                          \n
+                target_link_libraries(main PRIVATE flashlight::flashlight-text-kenlm)         \n
+              endif()                                                                         \n
+              target_compile_definitions(main PRIVATE USE_KENLM=$<BOOL:${FL_TEXT_USE_KENLM}>) \n
+            " > CMakeLists.txt
+      - run:
+          name: Build dependent external project
+          command: |
+            cd test_project && mkdir -p build
+            cmake -S . -B build -DBUILD_SHARED_LIBS=<< parameters.build_shared_libs >> && \
+            cmake --build build --parallel && ./build/main
+  cibw_build_wheels:
+    steps:
+      - run:
+          name: Compute wheel version
+          command: |
+            pip install packaging
+            python bindings/python/compute_version.py > BUILD_VERSION.txt
+            echo "Building version $(cat BUILD_VERSION.txt)"
+      - run:
+          name: Build wheels
+          command: |
+            python -m pip install cibuildwheel==2.16.5
+            python -m cibuildwheel --output-dir wheelhouse
+          environment:
+            CIBW_BEFORE_BUILD: pip install -v git+https://github.com/kpu/kenlm.git && pip install cmake
+            CIBW_PRERELEASE_PYTHONS: 0
+            CIBW_BUILD_VERBOSITY: 1
+  run_codecov:
+    steps:
+      - run:
+          name: "Get code coverage"
+          command: |
+            sudo apt-get install -y --no-install-recommends lcov curl && \
+            lcov --capture --directory . --output-file coverage.info && \
+            lcov --remove coverage.info '/usr/*' --output-file coverage.info &&
+            lcov --remove coverage.info '*/include/*' --output-file coverage.info && \
+            lcov --remove coverage.info '*/gtest/*' --output-file coverage.info && \
+            lcov --list coverage.info && \
+            bash <(curl -s https://codecov.io/bash) -f coverage.info \
+            -t $CODECOV_TOKEN \
+            || echo 'Codecov did not collect coverage reports'
+
+jobs:
+  ubuntu_20_gcc_9:
+    parameters:
+      resource_class:
+        type: string
+      use_kenlm:
+        type: string
+        default: "ON"
+      build_shared_libs:
+        type: string
+        default: "ON"
+      build_standalone:
+        type: string
+        default: "ON"
+      run_codecov:
+        type: string
+        default: "OFF"
+    <<: *linux_env
+    resource_class: << parameters.resource_class >>
+    steps:
+      - checkout
+      - install_ubuntu_build_dependencies:
+          use_kenlm: << parameters.use_kenlm >>
+      - when:
+          condition:
+            and:
+              - equal: ["OFF", << parameters.build_standalone >>]
+              - equal: ["ON", << parameters.use_kenlm >>]
+          steps:
+            - install_kenlm
+      - build_flashlight_text:
+          build_shared_libs: << parameters.build_shared_libs >>
+          use_kenlm: << parameters.use_kenlm >>
+          build_code_coverage: << parameters.run_codecov >>
+          build_standalone: << parameters.build_standalone >>
+      - run:
+          name: "Run C++ Tests"
+          command: |
+            cd build && ctest
+      - test_with_external_project:
+          build_shared_libs: << parameters.build_shared_libs >>
+      - when:
+          condition: << parameters.run_codecov >>
+          steps:
+            - run_codecov
+
+  ubuntu_20_gcc_9_python:
+    parameters:
+      resource_class:
+        type: string
+      use_kenlm:
+        type: string
+        default: "ON"
+    <<: *linux_env
+    resource_class: << parameters.resource_class >>
+    steps:
+      - checkout
+      - install_ubuntu_build_dependencies:
+          use_kenlm: << parameters.use_kenlm >>
+      - setup_python_virtualenv:
+          platform: "linux"
+      - install_python_bindings:
+          use_kenlm: << parameters.use_kenlm >>
+      - run_python_tests:
+          use_kenlm: << parameters.use_kenlm >>
+
+  macos_clang:
+    parameters:
+      resource_class:
+        type: string
+      use_kenlm:
+        type: string
+        default: "ON"
+      build_shared_libs:
+        type: string
+        default: "ON"
+      build_standalone:
+        type: string
+        default: "ON"
+    <<: *macos_env
+    shell: /bin/bash -eux -o pipefail
+    steps:
+      - checkout
+      - install_macos_build_dependencies:
+          use_kenlm: << parameters.use_kenlm >>
+      - when:
+          condition:
+            and:
+              - equal: ["OFF", << parameters.build_standalone >>]
+              - equal: ["ON", << parameters.use_kenlm >>]
+          steps:
+            - install_kenlm:
+                platform: "macos"
+      - build_flashlight_text:
+          platform: "macos"
+          use_kenlm: << parameters.use_kenlm >>
+          build_shared_libs: << parameters.build_shared_libs >>
+          build_standalone: << parameters.build_standalone >>
+
+  macos_clang_python:
+    parameters:
+      resource_class:
+        type: string
+      use_kenlm:
+        type: string
+        default: "ON"
+    <<: *macos_env
+    resource_class: << parameters.resource_class >>
+    shell: /bin/bash -eux -o pipefail
+    steps:
+      - checkout
+      - install_macos_build_dependencies:
+          use_kenlm: << parameters.use_kenlm >>
+      - setup_python_virtualenv:
+          platform: "macos"
+      - install_python_bindings:
+          use_kenlm: << parameters.use_kenlm >>
+      - run_python_tests:
+          use_kenlm: << parameters.use_kenlm >>
+
+  windows_msvc:
+    parameters:
+      build_shared_libs:
+        type: string
+        default: "OFF"
+      build_standalone:
+        type: string
+        default: "ON"
+    executor:
+      name: win/default
+      shell: bash.exe
+      size: 2xlarge
+    steps:
+      - checkout
+      - install_msvc_build_dependencies:
+          use_kenlm: "OFF"
+      - build_flashlight_text:
+          platform: "windows"
+          use_kenlm: "OFF"
+
+  windows_msvc_python:
+    parameters:
+      use_kenlm:
+        type: string
+        default: "OFF"
+    executor:
+      name: win/default
+      shell: bash.exe
+    steps:
+      - checkout
+      - install_msvc_build_dependencies:
+          use_kenlm: << parameters.use_kenlm >>
+      - setup_python_virtualenv:
+          platform: "windows"
+      - install_python_bindings:
+          use_kenlm: << parameters.use_kenlm >>
+      - run_python_tests:
+          use_kenlm: << parameters.use_kenlm >>
+
+  linux_arm64_wheels:
+    working_directory: ~/linux_arm64_wheels
+    <<: *linux_env
+    resource_class: arm.2xlarge
+    steps:
+      - checkout
+      - setup_python_virtualenv:
+          platform: "linux"
+      - cibw_build_wheels
+      - store_artifacts:
+          path: wheelhouse/
+      - persist_to_workspace:
+          root: ~/linux_arm64_wheels
+          paths:
+            - wheelhouse/
+
+  macos_arm64_wheels:
+    working_directory: ~/macos_arm64_wheels
+    <<: *macos_env
+    resource_class: macos.m1.medium.gen1
+    steps:
+      - checkout
+      - run:
+          name: Install Rosetta
+          command: sudo softwareupdate --install-rosetta --agree-to-license
+      - run:
+          name: Install macOS arm64-compatible Python 3.8.10
+          command: |
+            curl -o /tmp/Python38.pkg https://www.python.org/ftp/python/3.8.10/python-3.8.10-macos11.pkg
+            sudo installer -pkg /tmp/Python38.pkg -target /
+            sh "/Applications/Python 3.8/Install Certificates.command"
+      - setup_python_virtualenv:
+          platform: "macos"
+      - cibw_build_wheels
+      - store_artifacts:
+          path: wheelhouse/
+      - persist_to_workspace:
+          root: ~/macos_arm64_wheels
+          paths:
+            - wheelhouse/
+
+  upload_wheels_pypi:
+    <<: *linux_env
+    resource_class: xlarge
+    steps:
+      - attach_workspace:
+          at: ~/linux_arm64_wheels
+      - attach_workspace:
+          at: ~/macos_arm64_wheels
+      - run:
+          name: Consolidate wheels
+          command: |
+            mkdir wheelhouse
+            cp ~/linux_arm64_wheels/wheelhouse/*.whl wheelhouse/
+            cp ~/macos_arm64_wheels/wheelhouse/*.whl wheelhouse/
+            ls wheelhouse/*.whl
+      - setup_python_virtualenv:
+          platform: "linux"
+      - run:
+          name: Upload wheels to PyPI
+          command: |
+            pip install twine
+            twine upload wheelhouse/*.whl \
+              --skip-existing \
+              --verbose \
+              --non-interactive \
+              --username "__token__" \
+              --password "${TWINE_PASSWORD}"
+
+workflows:
+  build-test:
+    jobs:
+      - ubuntu_20_gcc_9:
+          build_shared_libs: "ON"
+          name: "Ubuntu 22.04 (<< matrix.resource_class >>) gcc-9 kenlm=<< matrix.use_kenlm >> standalone=<< matrix.build_standalone >>"
+          matrix:
+            parameters:
+              resource_class: [xlarge, arm.xlarge] # x64, arm64
+              use_kenlm: ["ON", "OFF"]
+              build_standalone: ["ON", "OFF"]
+      - ubuntu_20_gcc_9:
+          name: "Ubuntu 22.04 (xlarge) gcc-9 static + KenLM"
+          build_shared_libs: "OFF"
+          resource_class: xlarge
+          use_kenlm: "ON"
+          build_standalone: "ON"
+      - ubuntu_20_gcc_9:
+          name: "Compute Code Coverage and Upload to Codecov"
+          resource_class: xlarge
+          use_kenlm: "ON"
+          build_shared_libs: "ON"
+          run_codecov: "ON"
+      - ubuntu_20_gcc_9_python:
+          matrix:
+            parameters:
+              resource_class: [xlarge, arm.xlarge]
+              use_kenlm: ["ON", "OFF"]
+          name: "Ubuntu 22.04 (<< matrix.resource_class >>) gcc-9 Python kenlm=<< matrix.use_kenlm >>"
+      - macos_clang:
+          matrix:
+            parameters:
+              resource_class: [macos.x86.medium.gen2, macos.m1.medium.gen1]
+          name: "macOS (<< matrix.resource_class >>) Clang 13 no-standalone - shared + KenLM"
+          use_kenlm: "ON"
+          build_shared_libs: "ON"
+          build_standalone: "OFF"
+      - macos_clang_python:
+          matrix:
+            parameters:
+              resource_class: [macos.x86.medium.gen2, macos.m1.medium.gen1]
+          name: "macOS (<< matrix.resource_class >>) Clang 13 Python + KenLM"
+          use_kenlm: "ON"
+      - windows_msvc:
+          name: "Windows VS 17 2022 | MSVC 19.33 no-standalone"
+      - windows_msvc_python:
+          name: "Windows VS 17 2022 | MSVC 19.33 Python"
+      - windows_msvc_python:
+          name: "Windows VS 17 2022 | MSVC 19.33 Python + KenLM"
+          use_kenlm: "ON"
+  build-wheels:
+    jobs:
+      - linux_arm64_wheels:
+          name: "Build Python Wheels | Build wheels on ubuntu-22.04 arm64"
+      - macos_arm64_wheels:
+          name: "Build Python Wheels | Build wheels on macOS-14 arm64"
+      - upload_wheels_pypi:
+          requires:
+            - "Build Python Wheels | Build wheels on ubuntu-22.04 arm64"
+            - "Build Python Wheels | Build wheels on macOS-14 arm64"
+          filters:
+            branches:
+              only:
+                - main

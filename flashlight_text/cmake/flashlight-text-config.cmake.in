@@ -1,0 +1,49 @@
+# flashlight-text
+#
+# IMPORTED targets
+# ^^^^^^^^^^^^^^^^
+#
+# Configuration file for flashlight-text. Provides the following
+# `IMPORTED` targets:
+#
+# ``flashlight::flashlight-text``
+# ``flashlight::flashlight-text-kenlm`` if installed with KenLM
+#   The flashlight-text library.
+#
+# The above targets can be linked with your build using ``target_link_library``.
+# Example:
+#
+#   add_executable(myexecutable mySource.cpp)
+#   target_link_library(myexecutable PRIVATE flashlight::flashlight-text)
+#
+# The above properly links flashlight-text with myexecutable. No call to
+# ``target_include_directories`` is required.
+#
+
+# Dependencies
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+if (@FL_TEXT_USE_KENLM@)
+  find_dependency(kenlm)
+endif() # FL_TEXT_USE_KENLM
+
+################################################################################
+
+@PACKAGE_INIT@
+
+# Add IMPORTED targets
+if(NOT TARGET flashlight::flashlight-text)
+  if(EXISTS @PACKAGE_CMAKE_DIR@/flashlight-text-targets.cmake)
+    include(@PACKAGE_CMAKE_DIR@/flashlight-text-targets.cmake)
+  endif()
+endif()
+
+# Flashlight variables for downstream config use
+set(FL_TEXT_USE_KENLM @FL_TEXT_USE_KENLM@)
+
+# For legacy configurations
+set(flashlight-text_LIBRARIES flashlight::flashlight-text)
+if (EXISTS @PACKAGE_INCLUDE_DIRS@)
+  set(flashlight-text_INCLUDE_DIRS @PACKAGE_INCLUDE_DIRS@)
+endif()
+set(flashlight-text_FOUND 1)

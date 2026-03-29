@@ -1,0 +1,149 @@
+# Example LM decoder sweep config: Multi-objective TPE search (WER + speed)
+#
+# Usage:
+#   python hyperparameter_sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --devices cuda:0
+#
+#   # 2 concurrent workers on GPU 0, 1 on GPU 1
+#   python hyperparameter_sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --devices cuda:0:2,cuda:1
+#
+#   # Resume a previous sweep
+#   python hyperparameter_sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --resume
+
+study_name: "lm_decoder_sweep"
+
+# ---------------------------------------------------------------------------
+# Paths to LM resources (required)
+# ---------------------------------------------------------------------------
+lexicon_path: /path/to/lexicon_spaces.txt         # <-- UPDATE THIS
+tokens_path: /path/to/tokens.txt                   # <-- UPDATE THIS
+kenlm_model_path: /path/to/lm.bin                  # <-- UPDATE THIS
+logits_pkl_path: /path/to/inference_logits.pkl      # <-- UPDATE THIS
+
+# ---------------------------------------------------------------------------
+# LLM rescoring config
+# ---------------------------------------------------------------------------
+llm_cache_dir: ~/brand/huggingface
+llm_dtype: bfloat16
+llm_batch_size: 100
+
+# ---------------------------------------------------------------------------
+# Alpha post-hoc sweep
+# ---------------------------------------------------------------------------
+# After decoding, each trial sweeps alpha values cheaply (no re-decoding)
+# to find the best interpolation between n-gram and LLM scores:
+#   final = acoustic + (lm_weight * ngram) + (alpha * llm)
+alpha_range:
+  low: 0.0
+  high: 3.0
+  step: 0.05
+
+# ---------------------------------------------------------------------------
+# Eval settings
+# ---------------------------------------------------------------------------
+# Decode every Nth sentence (1 = all, 3 = every 3rd). Useful for faster
+# trials during initial exploration.
+eval_every_nth: 1
+
+# Reorder logit columns from [BLANK, ph1..phN, SIL] to [BLANK, SIL, ph1..phN]
+# as expected by flashlight-text. Set to false if logits are already in the
+# correct order.
+reorder_logit_columns: true
+
+# ---------------------------------------------------------------------------
+# Search config
+# ---------------------------------------------------------------------------
+search_strategy: "tpe"     # tpe (default, recommended), grid, nsga2, random
+n_trials: 100
+n_startup_trials: 10       # random trials before TPE modeling begins
+output_dir: /path/to/lm_sweep_output               # <-- UPDATE THIS
+
+# ---------------------------------------------------------------------------
+# Parameters to sweep
+# ---------------------------------------------------------------------------
+# Same type system as the encoder sweep:
+#   float_range: {type, low, high, log (optional)}
+#   int_range:   {type, low, high}
+#   choice:      {type, values: [...]}
+#   boolean:     {type}
+#   fixed:       {type, value}
+parameters:
+  beam_size:
+    type: int_range
+    low: 500
+    high: 10000
+
+  token_beam_size:
+    type: choice
+    values: [15, 21, 27, 35, 41]
+
+  beam_threshold:
+    type: float_range
+    low: 10.0
+    high: 60.0
+
+  blank_skip_threshold:
+    type: float_range
+    low: 0.95
+    high: 1.0
+
+  blank_penalty:
+    type: float_range
+    low: 1.0
+    high: 15.0
+
+  temperature:
+    type: float_range
+    low: 0.5
+    high: 2.0
+
+  lm_weight:
+    type: float_range
+    low: 0.5
+    high: 4.0
+
+  n_best:
+    type: choice
+    values: [50, 100, 200]
+
+  llm_length_penalty:
+    type: float_range
+    low: -0.5
+    high: 0.5
+
+  llm_model_name:
+    type: choice
+    values:
+      - "Qwen/Qwen3.5-4B"
+      # - "meta-llama/Llama-3.1-8B"
+
+# ---------------------------------------------------------------------------
+# Warm-starting (optional)
+# ---------------------------------------------------------------------------
+# Seed TPE with known-good configs. These are evaluated first, replacing
+# some random startup trials. Enqueued trials count toward n_trials.
+# initial_configs:
+#   - name: "current_best"
+#     params:
+#       beam_size: 7000
+#       token_beam_size: 21
+#       beam_threshold: 40.0
+#       blank_skip_threshold: 0.999
+#       blank_penalty: 5.0
+#       temperature: 1.0
+#       lm_weight: 1.7
+#       n_best: 100
+#       llm_length_penalty: 0.0
+#       llm_model_name: "Qwen/Qwen3.5-4B"
+#
+#   - name: "fast_baseline"
+#     params:
+#       beam_size: 500
+#       token_beam_size: 15
+#       beam_threshold: 20.0
+#       blank_skip_threshold: 0.95
+#       blank_penalty: 5.0
+#       temperature: 1.0
+#       lm_weight: 2.0
+#       n_best: 50
+#       llm_length_penalty: 0.0
+#       llm_model_name: "Qwen/Qwen3.5-4B"

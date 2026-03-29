@@ -1,0 +1,100 @@
+# Example LM decoder sweep config: Exhaustive grid search (WER + speed)
+#
+# Grid search evaluates ALL parameter combinations. n_trials is computed
+# automatically from the parameter space (product of all value counts).
+#
+# Usage:
+#   python hyperparameter_sweep/lm_sweep.py --sweep_config example_lm_sweep_grid.yaml --devices cuda:0
+#
+# This example has 3 * 3 * 3 * 3 * 3 * 1 = 243 combinations.
+
+study_name: "lm_decoder_grid"
+
+# ---------------------------------------------------------------------------
+# Paths to LM resources (required)
+# ---------------------------------------------------------------------------
+lexicon_path: /path/to/lexicon_spaces.txt         # <-- UPDATE THIS
+tokens_path: /path/to/tokens.txt                   # <-- UPDATE THIS
+kenlm_model_path: /path/to/lm.bin                  # <-- UPDATE THIS
+logits_pkl_path: /path/to/inference_logits.pkl      # <-- UPDATE THIS
+
+# ---------------------------------------------------------------------------
+# LLM rescoring config
+# ---------------------------------------------------------------------------
+llm_cache_dir: ~/brand/huggingface
+llm_dtype: bfloat16
+llm_batch_size: 100
+
+# ---------------------------------------------------------------------------
+# Alpha post-hoc sweep
+# ---------------------------------------------------------------------------
+alpha_range:
+  low: 0.0
+  high: 3.0
+  step: 0.05
+
+# ---------------------------------------------------------------------------
+# Eval settings
+# ---------------------------------------------------------------------------
+eval_every_nth: 1
+reorder_logit_columns: true
+
+# ---------------------------------------------------------------------------
+# Search config
+# ---------------------------------------------------------------------------
+search_strategy: "grid"
+# n_trials is computed automatically for grid search (product of all value counts)
+# n_startup_trials and initial_configs are ignored for grid search
+output_dir: /path/to/lm_grid_output                # <-- UPDATE THIS
+
+# ---------------------------------------------------------------------------
+# Parameters to sweep
+# ---------------------------------------------------------------------------
+# For grid search, use 'choice' for explicit values, or 'float_range'/'int_range'
+# with 'n_grid_points' to auto-discretize. Keep parameter counts small to avoid
+# combinatorial explosion.
+parameters:
+  beam_size:
+    type: choice
+    values: [1000, 3000, 7000]
+
+  token_beam_size:
+    type: choice
+    values: [15, 21, 35]
+
+  beam_threshold:
+    type: float_range
+    low: 20.0
+    high: 50.0
+    n_grid_points: 3          # -> [20.0, 35.0, 50.0]
+
+  blank_skip_threshold:
+    type: choice
+    values: [0.95, 0.999, 1.0]
+
+  lm_weight:
+    type: float_range
+    low: 1.0
+    high: 3.0
+    n_grid_points: 3          # -> [1.0, 2.0, 3.0]
+
+  # Fixed params (not swept, but override any defaults)
+  blank_penalty:
+    type: fixed
+    value: 5.0
+
+  temperature:
+    type: fixed
+    value: 1.0
+
+  n_best:
+    type: fixed
+    value: 100
+
+  llm_length_penalty:
+    type: fixed
+    value: 0.0
+
+  llm_model_name:
+    type: fixed
+    value: "Qwen/Qwen3.5-4B"
