@@ -17,6 +17,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from peft import LoraConfig, TaskType
 from trl import SFTTrainer, SFTConfig
 
+from phoneme_to_words_lm.utils import HF_CACHE_DIR
+
 
 def load_sentences(file_path: str) -> List[str]:
     """Load sentences from a text file, one per line. Skips blank lines and comments."""
@@ -223,8 +225,8 @@ def main():
                         help="Directory to save the LoRA adapter")
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3.5-4B",
                         help="HuggingFace model name or path")
-    parser.add_argument("--cache-dir", type=str, default="~/brand/huggingface",
-                        help="HuggingFace cache directory")
+    parser.add_argument("--cache-dir", type=str, default=None,
+                        help="HuggingFace cache directory (default: ~/brand/huggingface)")
     parser.add_argument("--max-seq-length", type=int, default=512)
     parser.add_argument("--num-epochs", type=float, default=3)
     parser.add_argument("--eval-every", type=float, default=0.25,
@@ -272,7 +274,7 @@ def main():
 
     # ---- Model & Tokenizer ----
     print(f"Loading model: {args.model_name}")
-    cache_dir = os.path.expanduser(args.cache_dir)
+    cache_dir = os.path.expanduser(args.cache_dir or HF_CACHE_DIR)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=cache_dir)
     if tokenizer.pad_token is None:

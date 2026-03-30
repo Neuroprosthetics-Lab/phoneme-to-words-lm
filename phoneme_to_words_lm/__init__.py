@@ -7,4 +7,5 @@ from phoneme_to_words_lm.utils import (
     PHONE_DEF_SIL_BLANK,
     LOGIT_PHONE_DEF,
     SIL_DEF,
+    HF_CACHE_DIR,
 )

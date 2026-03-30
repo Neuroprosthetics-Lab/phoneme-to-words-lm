@@ -21,7 +21,7 @@ logits_pkl_path: /path/to/inference_logits.pkl      # <-- UPDATE THIS
 # ---------------------------------------------------------------------------
 # LLM rescoring config
 # ---------------------------------------------------------------------------
-llm_cache_dir: ~/brand/huggingface
+# llm_cache_dir: ~/brand/huggingface  # override here
 llm_dtype: bfloat16
 llm_batch_size: 100
 

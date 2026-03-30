@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from phoneme_to_words_lm import KenLMFlashlightTextLM
-from phoneme_to_words_lm.utils import remove_punctuation, replace_words
+from phoneme_to_words_lm.utils import remove_punctuation, replace_words, HF_CACHE_DIR
 
 
 def parse_args():
@@ -211,7 +211,7 @@ def main():
         blank_penalty=float(trial_params["blank_penalty"]),
         do_llm_rescoring=True,
         llm_model_name=trial_params["llm_model_name"],
-        llm_cache_dir=cfg.get("llm_cache_dir", "~/brand/huggingface"),
+        llm_cache_dir=cfg.get("llm_cache_dir") or HF_CACHE_DIR,
         llm_device=cfg["llm_device"],
         llm_dtype=cfg.get("llm_dtype", "bfloat16"),
         llm_alpha=0.0,  # placeholder — alpha is swept post-hoc

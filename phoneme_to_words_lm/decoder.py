@@ -9,7 +9,7 @@ import torch
 import os
 from transformers import PreTrainedModel, PreTrainedTokenizer, AutoModelForCausalLM, AutoTokenizer
 from typing import Literal, Optional, List, Dict
-from phoneme_to_words_lm.utils import remove_punctuation, replace_words
+from phoneme_to_words_lm.utils import remove_punctuation, replace_words, HF_CACHE_DIR
 
 
 class KenLMFlashlightTextLM:
@@ -101,7 +101,7 @@ class KenLMFlashlightTextLM:
         # --- LLM rescoring ---
         do_llm_rescoring: bool = True,
         llm_model_name: str = 'Qwen/Qwen3.5-4B',
-        llm_cache_dir: str = '~/brand/huggingface',
+        llm_cache_dir: str = HF_CACHE_DIR,
         llm_device: str = 'cuda:0',
         llm_dtype: str = 'bfloat16',
         llm_alpha: float = 0.55,

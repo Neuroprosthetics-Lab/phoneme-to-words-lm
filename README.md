@@ -27,6 +27,7 @@ Additional capabilities:
 ## Table of Contents
 
 - [Installation](#installation)
+- [HuggingFace Cache Configuration](#huggingface-cache-configuration)
 - [KenLM File Setup](#kenlm-file-setup)
 - [Quick Start](#quick-start)
 - [Logit Preprocessing](#logit-preprocessing)
@@ -64,9 +65,43 @@ Note: flashlight-text requires a source modification because phoneme sequence ho
 pip install ./flashlight_text --no-build-isolation
 ```
 
+## HuggingFace Cache Configuration
+
+All HuggingFace downloads (LM files and LLM models) are stored in a single cache directory. The default is `~/brand/huggingface`. To change it, edit the `HF_CACHE_DIR` variable in `phoneme_to_words_lm/utils.py`.
+
 ## KenLM File Setup
 
-Note: you could conceivably use any tokenization scheme you want, but here we focus on phoeme-level decoding with a standard ARPAbet phoneme set. The instructions below assume you are starting with a WFST lexicon and an ARPA n-gram language model.
+Pre-built LM files are available on HuggingFace Hub. You can download them with the included script, or build your own from scratch.
+
+### Download pre-built files
+
+The 5-gram KenLM binary, lexicon, and token list are hosted at [nckcard/phoneme-lm-5gram](https://huggingface.co/nckcard/phoneme-lm-5gram).
+
+```bash
+# Download the unpruned 5-gram model (~50 GB) + lexicon + tokens
+python -m phoneme_to_words_lm.download_5gram --output-dir /path/to/lm_files
+
+# Download the pruned model instead (smaller)
+python -m phoneme_to_words_lm.download_5gram --pruned --output-dir /path/to/lm_files
+
+# Override cache directory for this download
+python -m phoneme_to_words_lm.download_5gram --output-dir /path/to/lm_files --cache-dir ~/other/cache
+```
+
+The script downloads files into the HuggingFace cache (for deduplication and resumable downloads) and creates symlinks in `--output-dir`.
+
+You can also download files programmatically:
+
+```python
+from phoneme_to_words_lm.download_5gram import download_5gram_files
+
+paths = download_5gram_files(output_dir='/path/to/lm_files', pruned=False)
+# paths = {'lexicon.txt': '...', 'tokens.txt': '...', '5gram_unpruned.bin': '...'}
+```
+
+### Build your own files
+
+Note: you could conceivably use any tokenization scheme you want, but here we focus on phoeme-level decoding with a standard ARPAbet phoneme set and a 5gram model trained on openwebtext2. The instructions below assume you are starting with a WFST lexicon and an ARPA n-gram language model.
 
 ### 1. Build KenLM from source
 
@@ -274,8 +309,7 @@ decoder = KenLMFlashlightTextLM(
     tokens_path='/path/to/tokens.txt',
     kenlm_model_path='/path/to/lm.bin',
     do_llm_rescoring=True,
-    llm_model_name='Qwen/Qwen3.5-4B',
-    llm_cache_dir='~/brand/huggingface',
+    llm_model_name='Qwen/Qwen3.5-4B', # llm_cache_dir defaults to ~/brand/huggingface
     llm_device='cuda:0',
     llm_dtype='bfloat16',
     llm_alpha=0.55,

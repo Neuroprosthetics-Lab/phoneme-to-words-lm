@@ -110,7 +110,7 @@ def load_lm_sweep_config(path):
     cfg.setdefault("n_startup_trials", 10)
     cfg.setdefault("eval_every_nth", 1)
     cfg.setdefault("reorder_logit_columns", True)
-    cfg.setdefault("llm_cache_dir", "~/brand/huggingface")
+    cfg.setdefault("llm_cache_dir", None)  # resolved to HF_CACHE_DIR at runtime
     cfg.setdefault("llm_dtype", "bfloat16")
     cfg.setdefault("llm_batch_size", 100)
 

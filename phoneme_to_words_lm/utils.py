@@ -5,6 +5,9 @@ import pickle
 from pathlib import Path
 
 
+# HuggingFace cache directory — used for both LLM model downloads and LM file downloads.
+HF_CACHE_DIR = '~/brand/huggingface'
+
 # Constants
 PHONE_DEF_SIL = [
     'AA', 'AE', 'AH', 'AO', 'AW',
