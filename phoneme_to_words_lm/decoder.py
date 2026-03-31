@@ -378,10 +378,10 @@ class KenLMFlashlightTextLM:
 
         if not word_seqs:
             return {
-                'word_seqs': [],
-                'ngram_scores': [],
-                'acoustic_scores': [],
-                'final_scores': [],
+                'word_seqs': [''],
+                'ngram_scores': [-math.inf],
+                'acoustic_scores': [-math.inf],
+                'final_scores': [-math.inf],
             }
 
         word_counts = np.array([len(s.split()) for s in word_seqs])
@@ -459,10 +459,10 @@ class KenLMFlashlightTextLM:
             # Decode
             if T_b == 0:
                 hypos.append({
-                    'word_seqs': [],
-                    'ngram_scores': [],
-                    'acoustic_scores': [],
-                    'final_scores': [],
+                    'word_seqs': [''],
+                    'ngram_scores': [-math.inf],
+                    'acoustic_scores': [-math.inf],
+                    'final_scores': [-math.inf],
                 })
                 continue
 
@@ -667,10 +667,10 @@ class KenLMFlashlightTextLM:
             self._online_active = False
             self._online_total_frames = 0
             return {
-                'word_seqs': [],
-                'ngram_scores': [],
-                'acoustic_scores': [],
-                'final_scores': [],
+                'word_seqs': [''],
+                'ngram_scores': [-math.inf],
+                'acoustic_scores': [-math.inf],
+                'final_scores': [-math.inf],
                 'ngram_time': None,
                 'llm_rescore_time': None,
             }
