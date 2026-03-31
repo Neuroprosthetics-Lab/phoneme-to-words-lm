@@ -48,6 +48,17 @@ search_strategy: "grid"
 output_dir: /path/to/lm_grid_output                # <-- UPDATE THIS
 
 # ---------------------------------------------------------------------------
+# Objective weights (optional)
+# ---------------------------------------------------------------------------
+# Weight WER vs decode time when ranking results. Both objectives are
+# min-max normalized to [0, 1], then combined:
+#   score = wer_weight * norm_wer + time_weight * norm_time
+# Higher weight = more important. Default is equal (1.0, 1.0).
+objective_weights:
+  wer: 2.0
+  time: 1.0
+
+# ---------------------------------------------------------------------------
 # Parameters to sweep
 # ---------------------------------------------------------------------------
 # For grid search, use 'choice' for explicit values, or 'float_range'/'int_range'

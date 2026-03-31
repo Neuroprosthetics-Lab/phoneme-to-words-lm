@@ -58,6 +58,17 @@ n_startup_trials: 10       # random trials before TPE modeling begins
 output_dir: /path/to/lm_sweep_output               # <-- UPDATE THIS
 
 # ---------------------------------------------------------------------------
+# Objective weights (optional)
+# ---------------------------------------------------------------------------
+# Weight WER vs decode time when ranking results. Both objectives are
+# min-max normalized to [0, 1], then combined:
+#   score = wer_weight * norm_wer + time_weight * norm_time
+# Higher weight = more important. Default is equal (1.0, 1.0).
+objective_weights:
+  wer: 2.0
+  time: 1.0
+
+# ---------------------------------------------------------------------------
 # Parameters to sweep
 # ---------------------------------------------------------------------------
 # Same type system as the encoder sweep:

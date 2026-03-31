@@ -122,6 +122,15 @@ def load_lm_sweep_config(path):
         cfg.alpha_range.setdefault("high", 3.0)
         cfg.alpha_range.setdefault("step", 0.05)
 
+    # Objective weights (for weighted ranking of results)
+    if "objective_weights" not in cfg or cfg.objective_weights is None:
+        cfg.objective_weights = OmegaConf.create({"wer": 1.0, "time": 1.0})
+    else:
+        cfg.objective_weights.setdefault("wer", 1.0)
+        cfg.objective_weights.setdefault("time", 1.0)
+        if cfg.objective_weights.wer < 0 or cfg.objective_weights.time < 0:
+            raise ValueError("objective_weights values must be non-negative")
+
     # Validate initial_configs structure if present
     if "initial_configs" in cfg and cfg.initial_configs is not None:
         if not OmegaConf.is_list(cfg.initial_configs):
@@ -350,46 +359,86 @@ def _get_pareto_trial_numbers(study):
         return set()
 
 
-def print_lm_results_table(study):
-    """Print a multi-objective results table with Pareto-optimal trials marked."""
+def _compute_weighted_scores(completed, wer_weight, time_weight):
+    """Compute weighted scores from normalized WER and decode time.
+
+    Both objectives are min-max normalized to [0, 1], then combined:
+        score = wer_weight * norm_wer + time_weight * norm_time
+    Lower score is better.
+
+    Returns a dict mapping trial.number -> weighted_score.
+    """
+    wers = [t.values[0] for t in completed]
+    times = [t.values[1] for t in completed]
+
+    wer_min, wer_max = min(wers), max(wers)
+    time_min, time_max = min(times), max(times)
+
+    wer_range = wer_max - wer_min if wer_max != wer_min else 1.0
+    time_range = time_max - time_min if time_max != time_min else 1.0
+
+    scores = {}
+    for t in completed:
+        norm_wer = (t.values[0] - wer_min) / wer_range
+        norm_time = (t.values[1] - time_min) / time_range
+        scores[t.number] = wer_weight * norm_wer + time_weight * norm_time
+    return scores
+
+
+def print_lm_results_table(study, objective_weights=None):
+    """Print a multi-objective results table with Pareto-optimal trials marked.
+
+    Args:
+        objective_weights: dict with 'wer' and 'time' keys for weighted ranking.
+            If None, defaults to equal weights (1.0, 1.0).
+    """
     completed = [t for t in study.trials
                  if t.state == optuna.trial.TrialState.COMPLETE]
     if not completed:
         print("No completed trials.")
         return
 
-    # Sort by WER (first objective)
-    completed.sort(key=lambda t: t.values[0])
+    if objective_weights is None:
+        objective_weights = {"wer": 1.0, "time": 1.0}
+    wer_weight = float(objective_weights["wer"])
+    time_weight = float(objective_weights["time"])
+
+    scores = _compute_weighted_scores(completed, wer_weight, time_weight)
+
+    # Sort by weighted score (lower is better)
+    completed.sort(key=lambda t: scores[t.number])
     pareto_numbers = _get_pareto_trial_numbers(study)
 
     param_names = sorted({k for t in completed for k in t.params.keys()})
 
     # Header
-    header = (f"{'Rank':<5} {'Trial':<7} {'WER':<10} {'Time(s)':<10} "
+    header = (f"{'Rank':<5} {'Trial':<7} {'Score':<10} {'WER':<10} {'Time(s)':<10} "
               f"{'Alpha':<8} ")
     header += " ".join(f"{p:<20}" for p in param_names)
     sep = "=" * len(header)
+
+    print(f"\nObjective weights: WER={wer_weight}, Time={time_weight}")
 
     # Pareto front section
     pareto_trials = [t for t in completed if t.number in pareto_numbers]
     if pareto_trials:
         print(f"\n{sep}")
-        print("PARETO FRONT (sorted by WER, best first)")
+        print("PARETO FRONT (sorted by weighted score, best first)")
         print(sep)
         print(header)
         print("-" * len(header))
         for rank, trial in enumerate(pareto_trials, 1):
-            _print_trial_row(rank, trial, param_names, pareto=True)
+            _print_trial_row(rank, trial, param_names, scores, pareto=True)
 
     # All trials section
     print(f"\n{sep}")
-    print("ALL TRIALS (sorted by WER, best first)")
+    print("ALL TRIALS (sorted by weighted score, best first)")
     print(sep)
     print(header)
     print("-" * len(header))
     for rank, trial in enumerate(completed, 1):
         is_pareto = trial.number in pareto_numbers
-        _print_trial_row(rank, trial, param_names, pareto=is_pareto)
+        _print_trial_row(rank, trial, param_names, scores, pareto=is_pareto)
 
     print()
     pruned = [t for t in study.trials
@@ -402,9 +451,10 @@ def print_lm_results_table(study):
           f"Pruned/Failed: {len(pruned) + len(failed)}")
 
 
-def _print_trial_row(rank, trial, param_names, pareto=False):
+def _print_trial_row(rank, trial, param_names, scores, pareto=False):
     """Print a single row of the results table."""
     marker = "*" if pareto else " "
+    score = scores[trial.number]
     wer = trial.values[0]
     decode_time = trial.values[1]
     alpha = trial.user_attrs.get("best_alpha", "N/A")
@@ -415,7 +465,7 @@ def _print_trial_row(rank, trial, param_names, pareto=False):
     config_label = ""
     if "initial_config_name" in trial.user_attrs:
         config_label = f" [{trial.user_attrs['initial_config_name']}]"
-    print(f"{rank:<4}{marker} {trial.number:<7} {wer:<10.5f} {decode_time:<10.4f} "
+    print(f"{rank:<4}{marker} {trial.number:<7} {score:<10.5f} {wer:<10.5f} {decode_time:<10.4f} "
           f"{alpha_str}{params_str}{config_label}")
 
 
@@ -474,6 +524,8 @@ def main():
             load_if_exists=False,
         )
 
+    study.set_metric_names(["WER", "Avg Decode Time (s)"])
+
     is_grid = sweep_cfg.search_strategy.lower() == "grid"
     if initial_configs and not is_grid:
         print(f"\nEnqueuing {n_initial_configs} initial config(s)...")
@@ -500,6 +552,8 @@ def main():
     print(f"Strategy: {sweep_cfg.search_strategy} | Trials: {n_trials} | "
           f"Concurrent jobs: {total_jobs}{initial_info}")
     print(f"Objectives: minimize WER, minimize decode time")
+    print(f"Objective weights: WER={sweep_cfg.objective_weights.wer}, "
+          f"Time={sweep_cfg.objective_weights.time}")
     print(f"Output: {sweep_cfg.output_dir}")
     print(f"DB: {db_path}\n")
 
@@ -511,7 +565,8 @@ def main():
     )
 
     # Print results
-    print_lm_results_table(study)
+    obj_weights = OmegaConf.to_container(sweep_cfg.objective_weights)
+    print_lm_results_table(study, objective_weights=obj_weights)
 
     # Generate visualizations
     print("\nGenerating visualizations...")
@@ -519,6 +574,8 @@ def main():
 
     # Summary
     pareto = study.best_trials
+    completed = [t for t in study.trials
+                 if t.state == optuna.trial.TrialState.COMPLETE]
     print(f"\nSweep complete!")
     print(f"  SQLite DB: {db_path}")
     print(f"  Output dir: {sweep_cfg.output_dir}")
@@ -534,6 +591,19 @@ def main():
         print(f"  Fastest on Pareto front:    Trial {best_time_trial.number} "
               f"(WER={best_time_trial.values[0]:.5f}, "
               f"Time={best_time_trial.values[1]:.4f}s)")
+    if completed:
+        # Show best trial by weighted score
+        scores = _compute_weighted_scores(
+            completed,
+            float(sweep_cfg.objective_weights.wer),
+            float(sweep_cfg.objective_weights.time),
+        )
+        best_score_num = min(scores, key=scores.get)
+        best_score_trial = next(t for t in completed if t.number == best_score_num)
+        print(f"  Best weighted score:        Trial {best_score_num} "
+              f"(Score={scores[best_score_num]:.5f}, "
+              f"WER={best_score_trial.values[0]:.5f}, "
+              f"Time={best_score_trial.values[1]:.4f}s)")
     print(f"\nTo explore interactively:")
     print(f"  pip install optuna-dashboard")
     print(f"  optuna-dashboard sqlite:///{db_path}")
