@@ -12,5 +12,8 @@ requires-python = ">=3.10"
 # PyTorch needs a specific CUDA index URL.
 dependencies = []
 
+[tool.setuptools.packages.find]
+include = ["phoneme_to_words_lm*"]
+
 [tool.setuptools.package-data]
 phoneme_to_words_lm = ["cmu_dict.pkl"]
