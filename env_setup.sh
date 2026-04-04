@@ -22,6 +22,12 @@ for arg in "$@"; do
     esac
 done
 
+# ── Ensure cmake is installed (needed for KenLM and flashlight-text) ─
+if ! command -v cmake &>/dev/null; then
+    echo "cmake not found — installing via apt..."
+    sudo apt install -y cmake
+fi
+
 source ~/miniconda3/bin/activate
 
 # Create fresh conda environment

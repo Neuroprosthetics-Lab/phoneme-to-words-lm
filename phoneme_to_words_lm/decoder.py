@@ -22,14 +22,9 @@ class KenLMFlashlightTextLM:
        list of word sequences, each with separate acoustic and n-gram LM scores.
 
     2. **LLM rescoring** (``llm_rescore``, optional): Scores the n-best
-       hypotheses with a causal language model and re-ranks using an
-       interpolated scoring formula inspired by the WFST pipeline::
+       hypotheses with a causal language model and re-ranks via this equation:
 
-           final = acoustic + lm_weight * ((1 - llm_alpha) * ngram + llm_alpha * llm)
-
-       where ``lm_weight`` controls the overall acoustic-vs-language balance
-       and ``llm_alpha`` interpolates between n-gram and LLM scores within
-       the language component.
+           final_score = acoustic_score + lm_weight * ngram_score + llm_alpha * llm_score + word_score * num_words
 
     Input logits are expected to be raw (pre-softmax) and are automatically
     preprocessed with temperature scaling, log-softmax, and blank penalty.
@@ -143,9 +138,8 @@ class KenLMFlashlightTextLM:
             llm_cache_dir: HuggingFace cache directory for LLM weights.
             llm_device: Torch device string for the LLM (e.g. 'cuda:0').
             llm_dtype: Precision for LLM weights ('float16' or 'bfloat16').
-            llm_alpha: Interpolation weight between n-gram and LLM scores (0 = pure
-                n-gram, 1 = pure LLM). Used in the rescoring formula:
-                ``final = acoustic + lm_weight * ((1 - alpha) * ngram + alpha * llm)``.
+            llm_alpha: Weight on LLM scores in the final rescoring formula:
+                ``final = acoustic + lm_weight * ngram + llm_alpha * llm + word_score * num_words``.
             llm_length_penalty: Per-token penalty subtracted from LLM scores.
             llm_batch_size: Batch size for LLM inference during rescoring.
             llm_lora_path: Path to a LoRA adapter directory (from peft). If provided,
@@ -410,7 +404,7 @@ class KenLMFlashlightTextLM:
         Applies logit preprocessing (temperature, log-softmax, blank penalty),
         optionally skips high-confidence blank frames per sample, then runs
         flashlight's ``LexiconDecoder`` to produce an n-best list ranked by
-        ``acoustic + lm_weight * ngram``.
+        ``acoustic + lm_weight * ngram + word_score * num_words``.
 
         Args:
             logits: CPU float32 contiguous tensor of shape ``(batch, time, num_tokens)``

@@ -35,7 +35,7 @@ def load_sentences(file_path: str) -> List[str]:
 def preprocess_sentences(sentences: List[str]) -> List[str]:
     """Lowercase, remove punctuation, and strip whitespace to match decoder output format.
 
-    Mirrors the normalization applied by the decoder in kenlm_flashlight_text_lm.py:
+    Mirrors the normalization applied by the decoder in decoder.py:
     remove_punctuation + replace_words (from phoneme_to_words_lm.utils).
     """
     from phoneme_to_words_lm.utils import remove_punctuation, replace_words

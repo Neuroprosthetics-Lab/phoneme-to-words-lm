@@ -40,6 +40,11 @@ Additional capabilities:
 
 ## Installation
 
+### Prerequisites
+
+- **Miniconda** installed at `~/miniconda3` ([install guide](https://docs.anaconda.com/miniconda/install/))
+- **CMake** (Linux: `sudo apt install cmake`)
+
 ### Environment setup
 
 Run the setup script to create a conda environment with all dependencies:
@@ -101,7 +106,7 @@ paths = download_5gram_files(output_dir='/path/to/lm_files', pruned=False)
 
 ### Build your own files
 
-Note: you could conceivably use any tokenization scheme you want, but here we focus on phoeme-level decoding with a standard ARPAbet phoneme set and a 5gram model trained on openwebtext2. The instructions below assume you are starting with a WFST lexicon and an ARPA n-gram language model.
+Note: you could conceivably use any tokenization scheme you want, but here we focus on phoneme-level decoding with a standard ARPAbet phoneme set and a 5gram model trained on openwebtext2. The instructions below assume you are starting with a WFST lexicon and an ARPA n-gram language model.
 
 ### 1. Build KenLM from source
 
