@@ -52,6 +52,7 @@ Run the setup script to create a conda environment with all dependencies:
 ```bash
 ./env_setup.sh           # full install (default)
 ./env_setup.sh --no-gpu  # skip GPU acceleration packages
+conda activate phoneme_lm
 ```
 
 This creates a `phoneme_lm` conda environment with PyTorch, flashlight-text (bundled with the required `kTrieMaxLabel = 60` patch), KenLM, and all other dependencies. The package itself is installed in editable mode (`pip install -e .`).
@@ -216,6 +217,8 @@ Your `lm.bin`, `lexicon.txt`, and `tokens.txt` should all go into one folder.
 
 ## Quick Start
 
+Use the phoneme_lm conda env: `conda activate phoneme_lm`
+
 ```python
 import torch
 from phoneme_to_words_lm import KenLMFlashlightTextLM
@@ -350,6 +353,7 @@ print(f"Final: {final['word_seqs'][0]}")
 Fine-tune a causal LLM with LoRA on domain-specific text for improved rescoring:
 
 ```bash
+conda activate phoneme_lm
 python -m phoneme_to_words_lm.finetune_llm \
     --source-files personal:/data/personal.txt switchboard:/data/swb.txt \
     --upsample-factors switchboard:4 \
@@ -409,6 +413,7 @@ optuna-dashboard sqlite:///path/to/sweep_output/sweep_study.db
 Test the decoder pipeline without a trained neural model by creating synthetic logits:
 
 ```bash
+conda activate phoneme_lm
 python examples/fake_logits_demo.py \
     --lexicon_path /path/to/lexicon.txt \
     --tokens_path /path/to/tokens.txt \
