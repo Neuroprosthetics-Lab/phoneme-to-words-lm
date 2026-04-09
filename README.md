@@ -33,6 +33,7 @@ Additional capabilities:
 - [Logit Preprocessing](#logit-preprocessing)
 - [Hyperparameters](#hyperparameters)
 - [LLM Rescoring](#llm-rescoring)
+- [Contextual Rescoring](#contextual-rescoring)
 - [Online Decoding](#online-decoding)
 - [LLM Finetuning](#llm-finetuning)
 - [Hyperparameter Sweep](#hyperparameter-sweep)
@@ -324,6 +325,84 @@ decoder = KenLMFlashlightTextLM(
     llm_lora_path=None,  # or path to LoRA adapter
 )
 ```
+
+## Contextual Rescoring
+
+Pass context strings (previous sentences, domain hints, keywords, etc.) to condition the LLM during rescoring. The context is prepended to each n-best hypothesis so the LLM's probability estimates are informed by prior information -- only the hypothesis tokens are scored.
+
+Context is applied at the LLM rescoring stage only (not the n-gram beam search), since the LLM is the component that can meaningfully leverage free-form textual context.
+
+### Offline decoding with context
+
+`offline_decode()` accepts a `contexts` list with one string per batch item:
+
+```python
+# Previous decoded sentences as context
+results = decoder.offline_decode(
+    logits,
+    lengths,
+    contexts=["the patient reported chest pain and shortness of breath"],
+)
+```
+
+For batched decoding, provide one context string per item in the batch:
+
+```python
+results = decoder.offline_decode(
+    logits,   # (B, T, N)
+    lengths,  # (B,)
+    contexts=[
+        "the patient reported chest pain",       # context for batch item 0
+        "we need two cups of flour and an egg",  # context for batch item 1
+    ],
+)
+```
+
+### Online (streaming) decoding with context
+
+`online_decode_end()` accepts a single `context` string:
+
+```python
+decoded_so_far = []
+
+for utterance_logits in utterance_stream:
+    decoder.online_decode_begin()
+
+    for frame in utterance_logits:
+        decoder.online_decode_step(frame)
+
+    # Pass previous decoded sentences as context
+    ctx = " ".join(decoded_so_far[-3:])  # last 3 sentences
+    final = decoder.online_decode_end(context=ctx)
+    decoded_so_far.append(final['word_seqs'][0])
+```
+
+### Example context formats
+
+Context can be any free-form text. Some patterns that may be effective:
+
+```python
+# Previous sentences
+context = "previous: i need two cups of flour\ncurrent: "
+
+# Domain hint
+context = "domain: cooking\n"
+
+# Keyword priming
+context = "keywords: flour oven recipe baking temperature\n"
+
+# Multi-turn history
+context = "speaker 1: i need to make a cake\nspeaker 2: what kind of cake\nspeaker 1: chocolate cake\nspeaker 2: "
+
+# Combined
+context = "domain: cooking\nprevious: i need two cups of flour\ncurrent: "
+```
+
+### Tips
+
+- Context is only used during LLM rescoring (`do_llm_rescoring=True`). It has no effect on the n-gram beam search stage.
+- The base LLM can use context out of the box with no retraining. For stronger context utilization, LoRA-finetune the LLM on context-prefixed training data (e.g., `"previous sentence\ncurrent sentence"` pairs).
+- Keep context concise -- very long contexts increase LLM memory usage and inference time. A few recent sentences is usually sufficient.
 
 ## Online Decoding
 

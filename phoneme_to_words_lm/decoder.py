@@ -262,6 +262,7 @@ class KenLMFlashlightTextLM:
         self,
         logits: torch.FloatTensor,
         lengths: Optional[torch.Tensor] = None,
+        contexts: Optional[List[str]] = None,
     ) -> List[Dict]:
         """Run the full offline decode pipeline: n-gram beam search + optional LLM rescoring.
 
@@ -271,11 +272,25 @@ class KenLMFlashlightTextLM:
                 Must be contiguous.
             lengths: Optional CPU int tensor of shape ``(batch,)`` with the valid
                 number of time steps per sample. If None, all frames are used.
+            contexts: Optional list of context strings, one per batch item.
+                Each context is prepended to the n-best hypotheses of its
+                batch item during LLM rescoring so the LLM conditions on
+                prior information (e.g. previously decoded sentences, domain
+                hints).  Has no effect when ``do_llm_rescoring`` is False.
+                Pass *None* to disable.
 
         Returns:
             List of hypothesis dicts (one per batch item), sorted best-first.
             See class docstring for the dict format.
         """
+
+        if contexts is not None:
+            B = logits.shape[0]
+            if len(contexts) != B:
+                raise ValueError(
+                    f"contexts must have length {B} (one per batch item), "
+                    f"got {len(contexts)}"
+                )
 
         t0 = time.perf_counter()
         hypos = self.ngram_decode(logits, lengths)
@@ -283,7 +298,7 @@ class KenLMFlashlightTextLM:
 
         if self.do_llm_rescoring:
             t1 = time.perf_counter()
-            hypos = self.llm_rescore(hypos)
+            hypos = self.llm_rescore(hypos, contexts=contexts)
             llm_time = time.perf_counter() - t1
         else:
             llm_time = None
@@ -469,6 +484,7 @@ class KenLMFlashlightTextLM:
     def llm_rescore(
         self,
         hypotheses: List[Dict],
+        contexts: Optional[List[str]] = None,
     ) -> List[Dict]:
         """Rescore n-best hypotheses with the LLM and re-rank.
 
@@ -478,6 +494,10 @@ class KenLMFlashlightTextLM:
 
         Args:
             hypotheses: List of hypothesis dicts as returned by ``ngram_decode``.
+            contexts: Optional list of context strings, one per batch item.
+                Each context is prepended to every n-best hypothesis of its
+                batch item so the LLM conditions on prior information (e.g.
+                previously decoded sentences).  Pass *None* to disable.
 
         Returns:
             List of hypothesis dicts with updated 'final_scores' reflecting the
@@ -486,23 +506,29 @@ class KenLMFlashlightTextLM:
 
         # Pool all hypotheses across batch items for packed LLM batching
         all_seqs = []
+        all_contexts = []
         offsets = []  # (start, end) per hypo, or None if empty
-        for hypo in hypotheses:
+        for idx, hypo in enumerate(hypotheses):
+            ctx = contexts[idx] if contexts is not None else ""
             if hypo['word_seqs']:
                 start = len(all_seqs)
                 all_seqs.extend(hypo['word_seqs'])
+                all_contexts.extend([ctx] * len(hypo['word_seqs']))
                 offsets.append((start, len(all_seqs)))
             else:
                 offsets.append(None)
 
         # Score all hypotheses in packed batches
+        has_contexts = contexts is not None and any(c for c in contexts)
         all_llm_scores = []
         for i in range(0, len(all_seqs), self.llm_batch_size):
+            batch_ctxs = all_contexts[i:i+self.llm_batch_size] if has_contexts else None
             batch_scores = _get_llm_scores(
                 self.llm_model,
                 self.llm_tokenizer,
                 all_seqs[i:i+self.llm_batch_size],
                 length_penalty=self.llm_length_penalty,
+                contexts=batch_ctxs,
             )
             all_llm_scores.extend(batch_scores)
 
@@ -643,13 +669,19 @@ class KenLMFlashlightTextLM:
         }
 
 
-    def online_decode_end(self) -> Dict:
+    def online_decode_end(self, context: Optional[str] = None) -> Dict:
         """Finalize online decoding and return the full n-best hypothesis list.
 
         Calls flashlight's ``decode_end`` to apply end-of-sentence LM scores,
         then retrieves the full n-best list and optionally rescores with the
         LLM. Resets streaming state so the decoder is ready for the next
         utterance (or offline use).
+
+        Args:
+            context: Optional context string prepended to all n-best
+                hypotheses during LLM rescoring (e.g. previously decoded
+                sentences).  Has no effect when ``do_llm_rescoring`` is
+                False.  Pass *None* to disable.
 
         Returns:
             Hypothesis dict (same format as offline ``offline_decode()`` output) with
@@ -677,9 +709,10 @@ class KenLMFlashlightTextLM:
         ngram_time = time.perf_counter() - t0
 
         # Optional LLM rescoring
+        ctx_list = [context] if context is not None else None
         if self.do_llm_rescoring and hypo['word_seqs']:
             t1 = time.perf_counter()
-            [hypo] = self.llm_rescore([hypo])
+            [hypo] = self.llm_rescore([hypo], contexts=ctx_list)
             llm_time = time.perf_counter() - t1
         else:
             llm_time = None
@@ -763,6 +796,7 @@ def _get_llm_scores(
     tokenizer: PreTrainedTokenizer,
     hypotheses: list[str],
     length_penalty: float = 0.0,
+    contexts: Optional[list[str]] = None,
 ) -> list[float]:
     """Score candidate hypotheses by summing shifted per-token log-probs.
 
@@ -771,12 +805,21 @@ def _get_llm_scores(
     An attention mask ensures that padding tokens do not contribute to
     the score.
 
+    When *contexts* is provided, each context string is prepended to its
+    corresponding hypothesis so that the LLM conditions on the context.
+    Only the hypothesis tokens are scored — context tokens serve purely
+    as conditioning and do not contribute to the returned score.
+
     Args:
         model: A causal LM returned by :func:`_build_llm`.
         tokenizer: The matching tokenizer returned by :func:`_build_llm`.
         hypotheses: Candidate sentence strings to score.
         length_penalty: If non-zero, subtract ``length_penalty * n_tokens``
-            from each score to penalise longer sequences.
+            from each score to penalise longer sequences.  When *contexts*
+            is provided, only hypothesis tokens count toward the length.
+        contexts: Optional list of context strings, one per hypothesis.
+            Each context is prepended to its hypothesis before scoring.
+            Pass *None* or a list of empty strings to disable.
 
     Returns:
         A list of float log-probability scores, one per hypothesis.
@@ -784,21 +827,80 @@ def _get_llm_scores(
     if not hypotheses:
         return []
 
-    inputs = tokenizer(hypotheses, return_tensors='pt', padding=True)
-    input_ids = inputs['input_ids'].to(model.device)
-    attention_mask = inputs['attention_mask'].to(model.device)
+    has_context = contexts is not None and any(c for c in contexts)
+
+    if not has_context:
+        # --- Fast path: no context (original behaviour) ---
+        inputs = tokenizer(hypotheses, return_tensors='pt', padding=True)
+        input_ids = inputs['input_ids'].to(model.device)
+        attention_mask = inputs['attention_mask'].to(model.device)
+
+        with torch.inference_mode():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+
+            # Shift: logits at position t predict token at position t+1
+            token_log_probs = log_probs[:, :-1, :].gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+
+            # Masked sum over real (non-padding) tokens
+            scores = (token_log_probs * attention_mask[:, 1:]).sum(dim=-1)
+
+            if length_penalty != 0.0:
+                scores = scores - length_penalty * attention_mask.sum(dim=-1)
+
+        return scores.tolist()
+
+    # --- Context path: prepend context, score only hypothesis tokens ---
+
+    # Detect whether the tokenizer normally adds a BOS token so the
+    # context path produces the same leading-token behaviour as the
+    # fast path (which uses tokenizer(...) with default settings).
+    adds_bos = getattr(tokenizer, 'add_bos_token', False)
+    bos_prefix = [tokenizer.bos_token_id] if adds_bos else []
+
+    pad_id = tokenizer.pad_token_id
+    full_id_lists = []
+    ctx_lens = []  # number of tokens to exclude from scoring per item
+
+    for ctx, hyp in zip(contexts, hypotheses):
+        if ctx and not ctx[-1].isspace():
+            ctx = ctx + " "
+        c_ids = tokenizer.encode(ctx, add_special_tokens=False) if ctx else []
+        h_ids = tokenizer.encode(hyp, add_special_tokens=False)
+        full_id_lists.append(bos_prefix + c_ids + h_ids)
+        ctx_lens.append(len(bos_prefix) + len(c_ids))
+
+    # Pad to uniform length
+    max_len = max(len(ids) for ids in full_id_lists)
+    input_ids = torch.tensor(
+        [ids + [pad_id] * (max_len - len(ids)) for ids in full_id_lists],
+        dtype=torch.long, device=model.device,
+    )
+    attention_mask = torch.tensor(
+        [[1] * len(ids) + [0] * (max_len - len(ids)) for ids in full_id_lists],
+        dtype=torch.long, device=model.device,
+    )
+    ctx_lens_t = torch.tensor(ctx_lens, dtype=torch.long, device=model.device)
 
     with torch.inference_mode():
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
         log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
 
-        # Shift: logits at position t predict token at position t+1
-        token_log_probs = log_probs[:, :-1, :].gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+        # Shift: position t predicts token at t+1
+        token_log_probs = log_probs[:, :-1, :].gather(
+            2, input_ids[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)
 
-        # Masked sum over real (non-padding) tokens
-        scores = (token_log_probs * attention_mask[:, 1:]).sum(dim=-1)
+        # Hypothesis-only mask: the predicted token at shifted position t
+        # is input_ids[:, t+1], which belongs to the hypothesis when
+        # t+1 >= ctx_len.
+        positions = torch.arange(max_len - 1, device=model.device).unsqueeze(0)
+        hyp_mask = ((positions + 1) >= ctx_lens_t.unsqueeze(1)).float()
+        hyp_mask = hyp_mask * attention_mask[:, 1:].float()
+
+        scores = (token_log_probs * hyp_mask).sum(dim=-1)
 
         if length_penalty != 0.0:
-            scores = scores - length_penalty * attention_mask.sum(dim=-1)
+            scores = scores - length_penalty * hyp_mask.sum(dim=-1)
 
     return scores.tolist()
