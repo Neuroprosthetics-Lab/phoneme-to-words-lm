@@ -130,7 +130,6 @@ def alpha_posthoc_sweep(all_results, lm_weight, alpha_low, alpha_high, alpha_ste
 
     alpha_wer_curve = []
     best_wer = float("inf")
-    best_alpha = 0.0
     best_n_edits = 0
     best_n_words = 0
 
@@ -156,9 +155,14 @@ def alpha_posthoc_sweep(all_results, lm_weight, alpha_low, alpha_high, alpha_ste
 
         if wer < best_wer:
             best_wer = wer
-            best_alpha = float(alpha)
             best_n_edits = n_edits_total
             best_n_words = n_words_total
+
+    # Among alphas tied at best WER, pick the middle one for stability.
+    # Two WERs are equal iff their edit counts are equal (n_words is constant),
+    # so float equality is exact here.
+    tied = [a for a, w in alpha_wer_curve if w == best_wer]
+    best_alpha = tied[len(tied) // 2]
 
     return best_alpha, best_wer, best_n_edits, best_n_words, alpha_wer_curve
 
@@ -218,6 +222,8 @@ def main():
         llm_length_penalty=float(trial_params["llm_length_penalty"]),
         llm_batch_size=int(cfg.get("llm_batch_size", 100)),
         llm_lora_path=cfg.get("llm_lora_path", None),
+        hotwords=cfg.get("hotwords"),
+        hotwords_path=cfg.get("hotwords_path"),
     )
     print(f"  Decoder initialized in {time.time() - t0:.1f}s")
     print()

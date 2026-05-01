@@ -72,16 +72,24 @@ objective_weights:
 # Parameters to sweep
 # ---------------------------------------------------------------------------
 # Same type system as the encoder sweep:
-#   float_range: {type, low, high, log (optional)}
-#   int_range:   {type, low, high}
+#   float_range: {type, low, high, log (optional), step (optional)}
+#   int_range:   {type, low, high, step (optional)}
 #   choice:      {type, values: [...]}
 #   boolean:     {type}
 #   fixed:       {type, value}
+#
+# 'step' defines discrete steps within a range. For float_range, step and log
+# cannot both be set. Examples:
+#   float_range with step: {type: float_range, low: 1.0, high: 5.0, step: 0.5}
+#     -> samples from {1.0, 1.5, 2.0, ..., 5.0}
+#   int_range with step:   {type: int_range, low: 500, high: 10000, step: 500}
+#     -> samples from {500, 1000, 1500, ..., 10000}
 parameters:
   beam_size:
     type: int_range
     low: 500
     high: 10000
+    step: 500
 
   token_beam_size:
     type: choice

@@ -1,15 +1,52 @@
 
 from __future__ import annotations
-from flashlight.lib.text.decoder import CriterionType, LexiconDecoderOptions, KenLM, Trie, SmearingMode, LexiconDecoder
+from flashlight.lib.text.decoder import CriterionType, LexiconDecoderOptions, KenLM, LM, Trie, SmearingMode, LexiconDecoder
 from flashlight.lib.text.dictionary import Dictionary, load_words, create_word_dict
 import math
 import time
 import numpy as np
 import torch
 import os
+import yaml
 from transformers import PreTrainedModel, PreTrainedTokenizer, AutoModelForCausalLM, AutoTokenizer
 from typing import Literal, Optional, List, Dict
 from phoneme_to_words_lm.utils import remove_punctuation, replace_words, HF_CACHE_DIR
+
+
+class BiasingLM(LM):
+    """KenLM wrapper that adds a per-word log-prob bonus at score-time.
+
+    Implements the flashlight ``LM`` interface by delegating ``start``,
+    ``score``, and ``finish`` to an inner ``KenLM`` instance. The override
+    on ``score`` adds ``hotword_bonus[label]`` (zero by default) to the
+    KenLM log-prob, producing the final per-word language-model score
+    seen by ``LexiconDecoder`` at word completion.
+
+    The bonus is in log10 space (matching KenLM's score units). Magnitude
+    can be mutated in place at any utterance boundary; the *set* of
+    hotword indices, however, also seeds the beam-search trie via
+    ``TRIE_HOTWORD_BIAS`` so partial-word paths survive beam pruning,
+    which means changing the *set* requires a trie rebuild upstream.
+    """
+
+    def __init__(self, inner: KenLM):
+        super().__init__()
+        self.inner = inner
+        # word_idx -> log10 bonus added to KenLM's score for that word.
+        self.hotword_bonus: Dict[int, float] = {}
+
+    def start(self, start_with_nothing: bool):
+        return self.inner.start(start_with_nothing)
+
+    def score(self, state, label: int):
+        new_state, s = self.inner.score(state, label)
+        bonus = self.hotword_bonus.get(label)
+        if bonus is not None:
+            s += bonus
+        return new_state, s
+
+    def finish(self, state):
+        return self.inner.finish(state)
 
 
 class KenLMFlashlightTextLM:
@@ -103,6 +140,9 @@ class KenLMFlashlightTextLM:
         llm_length_penalty: float = 0.0,
         llm_batch_size: int = 100,
         llm_lora_path: Optional[str] = None,
+        # --- Hotword biasing ---
+        hotwords: Optional[Dict[str, float]] = None,
+        hotwords_path: Optional[str] = None,
     ):
         """Initialize the decoder.
 
@@ -145,6 +185,18 @@ class KenLMFlashlightTextLM:
             llm_lora_path: Path to a LoRA adapter directory (from peft). If provided,
                 the adapter is merged into the base LLM weights at load time via
                 merge_and_unload(). None means use the base model as-is.
+            hotwords: Optional initial mapping of word -> log10 bonus added to the
+                language-model score for that word at decode time. Words must
+                already be in the lexicon (no g2p fallback). The set of hotword
+                indices also seeds a fixed bias into the beam-search trie so
+                partial-word paths survive pruning. Use ``set_hotwords`` /
+                ``clear_hotwords`` to mutate at runtime; mutations apply at the
+                next utterance boundary.
+            hotwords_path: Optional path to a YAML file containing a flat
+                ``{word: bonus}`` mapping (same shape as ``hotwords``). When
+                provided, the file is loaded and used as the initial hotword
+                set. If ``hotwords`` is also non-empty, it is ignored and a
+                warning is logged.
         """
 
         # store all params for use by init methods and decode/rescore
@@ -176,6 +228,19 @@ class KenLMFlashlightTextLM:
         self.llm_batch_size = llm_batch_size
         self.llm_lora_path = llm_lora_path
 
+        # Hotword biasing state. ``_hotwords`` is the canonical (word -> bonus)
+        # mapping currently applied to the decoder. ``_pending_hotwords`` is
+        # set by ``set_hotwords`` and consumed at the next utterance boundary
+        # so mid-decode swaps are impossible; ``None`` means nothing pending.
+        # File path takes precedence: if ``hotwords_path`` is set, ``hotwords``
+        # (inline) is ignored with a warning. Empty string is treated as unset
+        # so callers can disable cleanly via YAML without a None literal.
+        if hotwords_path:
+            self._hotwords: Dict[str, float] = _load_hotwords_from_file(hotwords_path)
+        else:
+            self._hotwords: Dict[str, float] = dict(hotwords) if hotwords else {}
+        self._pending_hotwords: Optional[Dict[str, float]] = None
+
         # online streaming state
         self._online_active = False
         self._online_total_frames = 0
@@ -203,13 +268,26 @@ class KenLMFlashlightTextLM:
         self.token_dict = Dictionary(self.tokens_path)
         self.lexicon = load_words(self.lexicon_path)
         self.word_dict = create_word_dict(self.lexicon)
-        self.lm = KenLM(self.kenlm_model_path, self.word_dict)
+        # Wrap KenLM in BiasingLM so hotword bonuses can be applied at score
+        # time without rebuilding the (large) KenLM. We delegate every method
+        # except score(); see BiasingLM for details.
+        self._kenlm = KenLM(self.kenlm_model_path, self.word_dict)
+        self.lm = BiasingLM(self._kenlm)
 
         self.sil_idx = self.token_dict.get_index(self.sil_token)
         self.blank_idx = self.token_dict.get_index(self.blank_token)
         self.unk_idx = self.word_dict.get_index(self.unk_token)
 
-        self.trie = _construct_trie(self.token_dict, self.word_dict, self.lexicon, self.lm, self.sil_idx)
+        # Resolve current hotwords into (word_idx -> bonus) and a set of
+        # word_indices used to bias the trie's lookahead scores.
+        hotword_idx_set, hotword_idx_bonus = self._resolve_hotwords(self._hotwords)
+        self.lm.hotword_bonus = hotword_idx_bonus
+        self._hotword_idx_set = hotword_idx_set
+
+        self.trie = _construct_trie(
+            self.token_dict, self.word_dict, self.lexicon, self._kenlm,
+            self.sil_idx, hotword_idx_set,
+        )
 
 
     def init_ngram_decoder(self):
@@ -258,10 +336,107 @@ class KenLMFlashlightTextLM:
         )
 
 
+    # =========================================================================
+    # Hotword biasing
+    # =========================================================================
+
+    def _resolve_hotwords(self, hotwords: Dict[str, float]):
+        """Map a {word: bonus} dict to (set_of_indices, {idx: bonus}).
+
+        Raises ``KeyError`` listing every word not present in the lexicon —
+        we don't fall back to g2p in v1, so the caller is told exactly which
+        entries failed and can fix the input.
+        """
+        if not hotwords:
+            return set(), {}
+        idx_set = set()
+        idx_bonus: Dict[int, float] = {}
+        missing = []
+        for word, bonus in hotwords.items():
+            w = word.lower().strip()
+            if not w or w not in self.lexicon:
+                missing.append(word)
+                continue
+            idx = self.word_dict.get_index(w)
+            idx_set.add(idx)
+            idx_bonus[idx] = float(bonus)
+        if missing:
+            raise KeyError(
+                f"Hotwords not in lexicon (no g2p fallback in v1): {missing!r}. "
+                f"Add them to {self.lexicon_path} and reload, or remove them."
+            )
+        return idx_set, idx_bonus
+
+    def set_hotwords(self, hotwords: Dict[str, float]) -> None:
+        """Replace the active hotword set with ``hotwords``.
+
+        The application is always *deferred* to the next utterance boundary
+        -- it runs at the top of ``online_decode_begin``, ``offline_decode``,
+        or ``ngram_decode``. This avoids mutating decoder state mid-utterance,
+        including the score-time bonuses read by ``BiasingLM.score``.
+
+        At apply time, if the *set* of hotword indices is unchanged from the
+        currently-applied set, only ``BiasingLM.hotword_bonus`` is updated
+        (no trie rebuild). Otherwise the trie and ``LexiconDecoder`` are
+        rebuilt.
+
+        Raises ``KeyError`` if any entry isn't already in the lexicon.
+        """
+        # Validate eagerly so caller errors surface at set time, not later.
+        # The resolved result is discarded; ``_apply_pending_hotwords`` will
+        # re-resolve at apply time against the (then-current) lexicon state.
+        self._resolve_hotwords(hotwords or {})
+
+        self._pending_hotwords = dict(hotwords) if hotwords else {}
+
+    def get_hotwords(self) -> Dict[str, float]:
+        """Return a copy of the currently-applied hotword mapping.
+
+        Pending (not-yet-applied) updates from ``set_hotwords`` are NOT
+        reflected here -- this is the ground-truth state of the decoder.
+        """
+        return dict(self._hotwords)
+
+    def clear_hotwords(self) -> None:
+        """Remove all hotwords. Equivalent to ``set_hotwords({})``."""
+        self.set_hotwords({})
+
+    def _apply_pending_hotwords(self) -> None:
+        """Apply a pending hotword change. No-op when nothing pending.
+
+        Called at the top of every decode entry point. When the hotword set
+        has changed, this rebuilds the trie (~few seconds for a 312k-entry
+        lexicon) and re-creates the LexiconDecoder. When only the per-word
+        magnitudes have changed, just the bonus dict is swapped. The KenLM
+        itself is reused -- it's the multi-GB cost we deliberately avoid
+        touching.
+        """
+        if self._pending_hotwords is None:
+            return
+        pending = self._pending_hotwords
+        new_idx_set, new_idx_bonus = self._resolve_hotwords(pending)
+
+        # Update bonus dict (read by BiasingLM.score from this point on).
+        self.lm.hotword_bonus = new_idx_bonus
+
+        # Rebuild trie + decoder if the set actually changed.
+        if new_idx_set != self._hotword_idx_set:
+            self._hotword_idx_set = new_idx_set
+            self.trie = _construct_trie(
+                self.token_dict, self.word_dict, self.lexicon, self._kenlm,
+                self.sil_idx, new_idx_set,
+            )
+            self.init_ngram_decoder()
+
+        self._hotwords = pending
+        self._pending_hotwords = None
+
+
     def offline_decode(
         self,
         logits: torch.FloatTensor,
         lengths: Optional[torch.Tensor] = None,
+        contexts: Optional[List[str]] = None,
     ) -> List[Dict]:
         """Run the full offline decode pipeline: n-gram beam search + optional LLM rescoring.
 
@@ -271,11 +446,27 @@ class KenLMFlashlightTextLM:
                 Must be contiguous.
             lengths: Optional CPU int tensor of shape ``(batch,)`` with the valid
                 number of time steps per sample. If None, all frames are used.
+            contexts: Optional list of context strings, one per batch item.
+                Each context is prepended to the n-best hypotheses of its
+                batch item during LLM rescoring so the LLM conditions on
+                prior information (e.g. previously decoded sentences, domain
+                hints).  Has no effect when ``do_llm_rescoring`` is False.
+                Pass *None* to disable.
 
         Returns:
             List of hypothesis dicts (one per batch item), sorted best-first.
             See class docstring for the dict format.
         """
+
+        if contexts is not None:
+            B = logits.shape[0]
+            if len(contexts) != B:
+                raise ValueError(
+                    f"contexts must have length {B} (one per batch item), "
+                    f"got {len(contexts)}"
+                )
+
+        self._apply_pending_hotwords()
 
         t0 = time.perf_counter()
         hypos = self.ngram_decode(logits, lengths)
@@ -283,7 +474,7 @@ class KenLMFlashlightTextLM:
 
         if self.do_llm_rescoring:
             t1 = time.perf_counter()
-            hypos = self.llm_rescore(hypos)
+            hypos = self.llm_rescore(hypos, contexts=contexts)
             llm_time = time.perf_counter() - t1
         else:
             llm_time = None
@@ -417,6 +608,7 @@ class KenLMFlashlightTextLM:
             'word_seqs', 'ngram_scores', 'acoustic_scores', and 'final_scores',
             all sorted best-first by the combined score.
         """
+        self._apply_pending_hotwords()
 
         logits = self.process_logits(logits)
 
@@ -469,6 +661,7 @@ class KenLMFlashlightTextLM:
     def llm_rescore(
         self,
         hypotheses: List[Dict],
+        contexts: Optional[List[str]] = None,
     ) -> List[Dict]:
         """Rescore n-best hypotheses with the LLM and re-rank.
 
@@ -478,6 +671,10 @@ class KenLMFlashlightTextLM:
 
         Args:
             hypotheses: List of hypothesis dicts as returned by ``ngram_decode``.
+            contexts: Optional list of context strings, one per batch item.
+                Each context is prepended to every n-best hypothesis of its
+                batch item so the LLM conditions on prior information (e.g.
+                previously decoded sentences).  Pass *None* to disable.
 
         Returns:
             List of hypothesis dicts with updated 'final_scores' reflecting the
@@ -486,23 +683,29 @@ class KenLMFlashlightTextLM:
 
         # Pool all hypotheses across batch items for packed LLM batching
         all_seqs = []
+        all_contexts = []
         offsets = []  # (start, end) per hypo, or None if empty
-        for hypo in hypotheses:
+        for idx, hypo in enumerate(hypotheses):
+            ctx = contexts[idx] if contexts is not None else ""
             if hypo['word_seqs']:
                 start = len(all_seqs)
                 all_seqs.extend(hypo['word_seqs'])
+                all_contexts.extend([ctx] * len(hypo['word_seqs']))
                 offsets.append((start, len(all_seqs)))
             else:
                 offsets.append(None)
 
         # Score all hypotheses in packed batches
+        has_contexts = contexts is not None and any(c for c in contexts)
         all_llm_scores = []
         for i in range(0, len(all_seqs), self.llm_batch_size):
+            batch_ctxs = all_contexts[i:i+self.llm_batch_size] if has_contexts else None
             batch_scores = _get_llm_scores(
                 self.llm_model,
                 self.llm_tokenizer,
                 all_seqs[i:i+self.llm_batch_size],
                 length_penalty=self.llm_length_penalty,
+                contexts=batch_ctxs,
             )
             all_llm_scores.extend(batch_scores)
 
@@ -549,6 +752,7 @@ class KenLMFlashlightTextLM:
         If called while a previous utterance is still active, the old
         state is abandoned and a fresh decode session begins.
         """
+        self._apply_pending_hotwords()
         self.ngram_decoder.decode_begin()
         self._online_total_frames = 0
         self._online_active = True
@@ -643,13 +847,19 @@ class KenLMFlashlightTextLM:
         }
 
 
-    def online_decode_end(self) -> Dict:
+    def online_decode_end(self, context: Optional[str] = None) -> Dict:
         """Finalize online decoding and return the full n-best hypothesis list.
 
         Calls flashlight's ``decode_end`` to apply end-of-sentence LM scores,
         then retrieves the full n-best list and optionally rescores with the
         LLM. Resets streaming state so the decoder is ready for the next
         utterance (or offline use).
+
+        Args:
+            context: Optional context string prepended to all n-best
+                hypotheses during LLM rescoring (e.g. previously decoded
+                sentences).  Has no effect when ``do_llm_rescoring`` is
+                False.  Pass *None* to disable.
 
         Returns:
             Hypothesis dict (same format as offline ``offline_decode()`` output) with
@@ -677,9 +887,10 @@ class KenLMFlashlightTextLM:
         ngram_time = time.perf_counter() - t0
 
         # Optional LLM rescoring
+        ctx_list = [context] if context is not None else None
         if self.do_llm_rescoring and hypo['word_seqs']:
             t1 = time.perf_counter()
-            [hypo] = self.llm_rescore([hypo])
+            [hypo] = self.llm_rescore([hypo], contexts=ctx_list)
             llm_time = time.perf_counter() - t1
         else:
             llm_time = None
@@ -694,15 +905,56 @@ class KenLMFlashlightTextLM:
         return hypo
 
 
-def _construct_trie(tokens_dict, word_dict, lexicon, lm, silence):
-    """Build a flashlight Trie from the lexicon, seeded with unigram LM scores."""
+def _load_hotwords_from_file(path: str) -> Dict[str, float]:
+    """Load a flat ``{word: bonus}`` mapping from a YAML file.
+
+    The file must parse to a top-level mapping (or be empty/null, in which
+    case an empty dict is returned). Keys are coerced to ``str`` and values
+    to ``float``; the caller is responsible for lexicon validation. The
+    path is run through ``os.path.expanduser`` so ``~`` is supported.
+    """
+    expanded = os.path.expanduser(path)
+    if not os.path.exists(expanded):
+        raise FileNotFoundError(f"hotwords_path does not exist: {expanded}")
+    with open(expanded, 'r') as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"hotwords file {expanded} must be a top-level mapping of "
+            f"word -> bonus, got {type(data).__name__}."
+        )
+    return {str(k): float(v) for k, v in data.items()}
+
+
+# Trie-side hotword bias (log10). Big enough to dominate lookahead-pruning
+# decisions for hotword paths, but the value never reaches the final
+# hypothesis score because the decoder subtracts ``lexMaxScore`` at word
+# completion (see ``LexiconDecoder.cpp:127``). The actual ranking effect comes
+# from ``BiasingLM.hotword_bonus`` at score-time; this constant only changes
+# *which paths survive the beam* during partial-word traversal.
+TRIE_HOTWORD_BIAS = 5.0
+
+
+def _construct_trie(tokens_dict, word_dict, lexicon, lm, silence, hotword_idx_set=None):
+    """Build a flashlight Trie from the lexicon, seeded with unigram LM scores.
+
+    When ``hotword_idx_set`` is non-empty, the seed score for those word
+    indices is bumped by ``TRIE_HOTWORD_BIAS`` so partial-word paths leading
+    to them are kept alive by beam pruning even when the surrounding context
+    doesn't favor them.
+    """
     vocab_size = tokens_dict.index_size()
     trie = Trie(vocab_size, silence)
     start_state = lm.start(False)
+    hotword_idx_set = hotword_idx_set or set()
 
     for word, spellings in lexicon.items():
         word_idx = word_dict.get_index(word)
         _, score = lm.score(start_state, word_idx)
+        if word_idx in hotword_idx_set:
+            score += TRIE_HOTWORD_BIAS
         for spelling in spellings:
             spelling_idx = [tokens_dict.get_index(token) for token in spelling]
             trie.insert(spelling_idx, word_idx, score)
@@ -737,7 +989,7 @@ def _build_llm(
 
     torch_dtype = torch.float16 if dtype == 'float16' else torch.bfloat16
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, local_files_only=False)
     tokenizer.padding_side = "right"
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -746,6 +998,7 @@ def _build_llm(
         cache_dir=cache_dir,
         dtype=torch_dtype,
         attn_implementation='sdpa',
+        local_files_only=False,
     )
 
     if lora_path is not None:
@@ -763,6 +1016,7 @@ def _get_llm_scores(
     tokenizer: PreTrainedTokenizer,
     hypotheses: list[str],
     length_penalty: float = 0.0,
+    contexts: Optional[list[str]] = None,
 ) -> list[float]:
     """Score candidate hypotheses by summing shifted per-token log-probs.
 
@@ -771,12 +1025,21 @@ def _get_llm_scores(
     An attention mask ensures that padding tokens do not contribute to
     the score.
 
+    When *contexts* is provided, each context string is prepended to its
+    corresponding hypothesis so that the LLM conditions on the context.
+    Only the hypothesis tokens are scored — context tokens serve purely
+    as conditioning and do not contribute to the returned score.
+
     Args:
         model: A causal LM returned by :func:`_build_llm`.
         tokenizer: The matching tokenizer returned by :func:`_build_llm`.
         hypotheses: Candidate sentence strings to score.
         length_penalty: If non-zero, subtract ``length_penalty * n_tokens``
-            from each score to penalise longer sequences.
+            from each score to penalise longer sequences.  When *contexts*
+            is provided, only hypothesis tokens count toward the length.
+        contexts: Optional list of context strings, one per hypothesis.
+            Each context is prepended to its hypothesis before scoring.
+            Pass *None* or a list of empty strings to disable.
 
     Returns:
         A list of float log-probability scores, one per hypothesis.
@@ -784,21 +1047,80 @@ def _get_llm_scores(
     if not hypotheses:
         return []
 
-    inputs = tokenizer(hypotheses, return_tensors='pt', padding=True)
-    input_ids = inputs['input_ids'].to(model.device)
-    attention_mask = inputs['attention_mask'].to(model.device)
+    has_context = contexts is not None and any(c for c in contexts)
+
+    if not has_context:
+        # --- Fast path: no context (original behaviour) ---
+        inputs = tokenizer(hypotheses, return_tensors='pt', padding=True)
+        input_ids = inputs['input_ids'].to(model.device)
+        attention_mask = inputs['attention_mask'].to(model.device)
+
+        with torch.inference_mode():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+
+            # Shift: logits at position t predict token at position t+1
+            token_log_probs = log_probs[:, :-1, :].gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+
+            # Masked sum over real (non-padding) tokens
+            scores = (token_log_probs * attention_mask[:, 1:]).sum(dim=-1)
+
+            if length_penalty != 0.0:
+                scores = scores - length_penalty * attention_mask.sum(dim=-1)
+
+        return scores.tolist()
+
+    # --- Context path: prepend context, score only hypothesis tokens ---
+
+    # Detect whether the tokenizer normally adds a BOS token so the
+    # context path produces the same leading-token behaviour as the
+    # fast path (which uses tokenizer(...) with default settings).
+    adds_bos = getattr(tokenizer, 'add_bos_token', False)
+    bos_prefix = [tokenizer.bos_token_id] if adds_bos else []
+
+    pad_id = tokenizer.pad_token_id
+    full_id_lists = []
+    ctx_lens = []  # number of tokens to exclude from scoring per item
+
+    for ctx, hyp in zip(contexts, hypotheses):
+        if ctx and not ctx[-1].isspace():
+            ctx = ctx + " "
+        c_ids = tokenizer.encode(ctx, add_special_tokens=False) if ctx else []
+        h_ids = tokenizer.encode(hyp, add_special_tokens=False)
+        full_id_lists.append(bos_prefix + c_ids + h_ids)
+        ctx_lens.append(len(bos_prefix) + len(c_ids))
+
+    # Pad to uniform length
+    max_len = max(len(ids) for ids in full_id_lists)
+    input_ids = torch.tensor(
+        [ids + [pad_id] * (max_len - len(ids)) for ids in full_id_lists],
+        dtype=torch.long, device=model.device,
+    )
+    attention_mask = torch.tensor(
+        [[1] * len(ids) + [0] * (max_len - len(ids)) for ids in full_id_lists],
+        dtype=torch.long, device=model.device,
+    )
+    ctx_lens_t = torch.tensor(ctx_lens, dtype=torch.long, device=model.device)
 
     with torch.inference_mode():
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
         log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
 
-        # Shift: logits at position t predict token at position t+1
-        token_log_probs = log_probs[:, :-1, :].gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+        # Shift: position t predicts token at t+1
+        token_log_probs = log_probs[:, :-1, :].gather(
+            2, input_ids[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)
 
-        # Masked sum over real (non-padding) tokens
-        scores = (token_log_probs * attention_mask[:, 1:]).sum(dim=-1)
+        # Hypothesis-only mask: the predicted token at shifted position t
+        # is input_ids[:, t+1], which belongs to the hypothesis when
+        # t+1 >= ctx_len.
+        positions = torch.arange(max_len - 1, device=model.device).unsqueeze(0)
+        hyp_mask = ((positions + 1) >= ctx_lens_t.unsqueeze(1)).float()
+        hyp_mask = hyp_mask * attention_mask[:, 1:].float()
+
+        scores = (token_log_probs * hyp_mask).sum(dim=-1)
 
         if length_penalty != 0.0:
-            scores = scores - length_penalty * attention_mask.sum(dim=-1)
+            scores = scores - length_penalty * hyp_mask.sum(dim=-1)
 
     return scores.tolist()
