@@ -1,9 +1,9 @@
 """
-Multi-objective Optuna hyperparameter sweep for the LM decoder.
+Optuna hyperparameter sweep for the LM decoder.
 
-Optimizes both WER (accuracy) and decode time (speed) using Optuna's
-TPESampler with multi-objective support. Each trial is executed as a
-subprocess (lm_sweep_worker.py) for GPU isolation.
+Optimizes a weighted combination of WER (accuracy) and decode time (speed)
+as a single scalar objective. Each trial is executed as a subprocess
+(lm_sweep_worker.py) for GPU isolation.
 
 Usage:
     python hyperparameter_sweep/lm_sweep.py --sweep_config lm_sweep.yaml --devices cuda:0
@@ -35,6 +35,7 @@ from phoneme_to_words_lm.sweep_utils import (
     enqueue_initial_configs,
     _build_grid_search_space,
 )
+from phoneme_to_words_lm.utils import HF_CACHE_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,7 @@ from phoneme_to_words_lm.sweep_utils import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Multi-objective Optuna sweep for the LM decoder (WER + speed)")
+        description="Optuna sweep for the LM decoder (weighted WER + speed)")
     parser.add_argument("--sweep_config", type=str, required=True,
                         help="Path to LM sweep config YAML")
     parser.add_argument("--devices", type=str, default="cuda:0",
@@ -150,7 +151,7 @@ def load_lm_sweep_config(path):
 # ---------------------------------------------------------------------------
 
 def create_lm_sampler(strategy, parameters=None, n_initial_configs=0, n_startup_trials=10):
-    """Create an Optuna sampler for multi-objective optimization."""
+    """Create an Optuna sampler for optimization."""
     strategy = strategy.lower()
     if strategy == "tpe":
         effective_startup = max(0, n_startup_trials - n_initial_configs)
@@ -172,13 +173,18 @@ def create_lm_sampler(strategy, parameters=None, n_initial_configs=0, n_startup_
 # ---------------------------------------------------------------------------
 
 def make_lm_objective(sweep_cfg, gpu_pool, worker_script_path, gpu_concurrency):
-    """Return a multi-objective closure for study.optimize().
+    """Return a single-objective closure for study.optimize().
+
+    Returns a weighted combination of WER and decode time:
+        score = wer_weight * wer + time_weight * avg_decode_time
 
     Args:
         gpu_concurrency: dict mapping gpu_id -> n_jobs, used to compute
             per-process VRAM fraction (e.g. 2 jobs on one GPU -> 0.5 each).
     """
     parameters = sweep_cfg.parameters
+    wer_weight = float(sweep_cfg.objective_weights.wer)
+    time_weight = float(sweep_cfg.objective_weights.time)
 
     def objective(trial):
         # Suggest hyperparameters
@@ -253,17 +259,21 @@ def make_lm_objective(sweep_cfg, gpu_pool, worker_script_path, gpu_concurrency):
             wer = results["wer"]
             avg_decode_time = results["avg_decode_time"]
 
-            # Store metadata as trial attributes
+            # Store individual metrics and metadata as trial attributes
+            trial.set_user_attr("wer", wer)
+            trial.set_user_attr("avg_decode_time", avg_decode_time)
             trial.set_user_attr("best_alpha", results["best_alpha"])
             trial.set_user_attr("n_sentences", results["n_sentences_evaluated"])
             trial.set_user_attr("n_words", results["n_words_total"])
             trial.set_user_attr("n_edits", results["n_edits_total"])
 
+            score = wer_weight * wer + time_weight * avg_decode_time
             print(f"  Trial {trial.number} | WER = {wer:.5f} | "
                   f"Time = {avg_decode_time:.4f}s/sent | "
+                  f"Score = {score:.5f} | "
                   f"Alpha = {results['best_alpha']:.3f}")
 
-            return wer, avg_decode_time
+            return score
 
         finally:
             gpu_pool.release(gpu_id)
@@ -276,13 +286,12 @@ def make_lm_objective(sweep_cfg, gpu_pool, worker_script_path, gpu_concurrency):
 # ---------------------------------------------------------------------------
 
 def generate_lm_visualizations(study, output_dir):
-    """Generate multi-objective visualizations including Pareto front."""
+    """Generate single-objective visualizations."""
     try:
         from optuna.visualization import (
             plot_optimization_history,
             plot_param_importances,
             plot_parallel_coordinate,
-            plot_pareto_front,
         )
     except ImportError:
         print("Install plotly for visualizations: pip install plotly")
@@ -297,48 +306,40 @@ def generate_lm_visualizations(study, output_dir):
         print("Not enough completed trials for visualizations.")
         return
 
-    # Pareto front
+    # Optimization history (weighted score)
     try:
-        fig = plot_pareto_front(
-            study,
-            target_names=["WER", "Avg Decode Time (s)"],
-        )
-        fig.write_html(os.path.join(vis_dir, "pareto_front.html"))
-        print("  Saved pareto_front.html")
+        fig = plot_optimization_history(study)
+        fig.write_html(os.path.join(vis_dir, "optimization_history.html"))
+        print("  Saved optimization_history.html")
     except Exception as e:
-        print(f"  Could not generate pareto_front: {e}")
+        print(f"  Could not generate optimization_history: {e}")
 
-    # Per-objective optimization history
-    for idx, name in enumerate(["wer", "time"]):
+    # Per-metric optimization history via user attributes
+    for attr, label in [("wer", "WER"), ("avg_decode_time", "Avg Decode Time (s)")]:
         try:
             fig = plot_optimization_history(
                 study,
-                target=lambda t, i=idx: t.values[i],
-                target_name="WER" if idx == 0 else "Avg Decode Time (s)",
+                target=lambda t, a=attr: t.user_attrs[a],
+                target_name=label,
             )
-            fig.write_html(os.path.join(vis_dir, f"optimization_history_{name}.html"))
-            print(f"  Saved optimization_history_{name}.html")
+            fig.write_html(os.path.join(vis_dir, f"optimization_history_{attr}.html"))
+            print(f"  Saved optimization_history_{attr}.html")
         except Exception as e:
-            print(f"  Could not generate optimization_history_{name}: {e}")
+            print(f"  Could not generate optimization_history_{attr}: {e}")
 
-    # Param importances per objective
-    for idx, name in enumerate(["wer", "time"]):
-        try:
-            fig = plot_param_importances(
-                study,
-                target=lambda t, i=idx: t.values[i],
-                target_name="WER" if idx == 0 else "Avg Decode Time (s)",
-            )
-            fig.write_html(os.path.join(vis_dir, f"param_importances_{name}.html"))
-            print(f"  Saved param_importances_{name}.html")
-        except Exception as e:
-            print(f"  Could not generate param_importances_{name}: {e}")
+    # Param importances (weighted score)
+    try:
+        fig = plot_param_importances(study)
+        fig.write_html(os.path.join(vis_dir, "param_importances.html"))
+        print("  Saved param_importances.html")
+    except Exception as e:
+        print(f"  Could not generate param_importances: {e}")
 
     # Parallel coordinate (colored by WER)
     try:
         fig = plot_parallel_coordinate(
             study,
-            target=lambda t: t.values[0],
+            target=lambda t: t.user_attrs["wer"],
             target_name="WER",
         )
         fig.write_html(os.path.join(vis_dir, "parallel_coordinate.html"))
@@ -351,45 +352,11 @@ def generate_lm_visualizations(study, output_dir):
 # Results table
 # ---------------------------------------------------------------------------
 
-def _get_pareto_trial_numbers(study):
-    """Return set of trial numbers on the Pareto front."""
-    try:
-        return {t.number for t in study.best_trials}
-    except Exception:
-        return set()
-
-
-def _compute_weighted_scores(completed, wer_weight, time_weight):
-    """Compute weighted scores from normalized WER and decode time.
-
-    Both objectives are min-max normalized to [0, 1], then combined:
-        score = wer_weight * norm_wer + time_weight * norm_time
-    Lower score is better.
-
-    Returns a dict mapping trial.number -> weighted_score.
-    """
-    wers = [t.values[0] for t in completed]
-    times = [t.values[1] for t in completed]
-
-    wer_min, wer_max = min(wers), max(wers)
-    time_min, time_max = min(times), max(times)
-
-    wer_range = wer_max - wer_min if wer_max != wer_min else 1.0
-    time_range = time_max - time_min if time_max != time_min else 1.0
-
-    scores = {}
-    for t in completed:
-        norm_wer = (t.values[0] - wer_min) / wer_range
-        norm_time = (t.values[1] - time_min) / time_range
-        scores[t.number] = wer_weight * norm_wer + time_weight * norm_time
-    return scores
-
-
 def print_lm_results_table(study, objective_weights=None):
-    """Print a multi-objective results table with Pareto-optimal trials marked.
+    """Print results table sorted by objective score (lower is better).
 
     Args:
-        objective_weights: dict with 'wer' and 'time' keys for weighted ranking.
+        objective_weights: dict with 'wer' and 'time' keys (for display).
             If None, defaults to equal weights (1.0, 1.0).
     """
     completed = [t for t in study.trials
@@ -403,11 +370,8 @@ def print_lm_results_table(study, objective_weights=None):
     wer_weight = float(objective_weights["wer"])
     time_weight = float(objective_weights["time"])
 
-    scores = _compute_weighted_scores(completed, wer_weight, time_weight)
-
-    # Sort by weighted score (lower is better)
-    completed.sort(key=lambda t: scores[t.number])
-    pareto_numbers = _get_pareto_trial_numbers(study)
+    # Sort by objective value (lower is better)
+    completed.sort(key=lambda t: t.value)
 
     param_names = sorted({k for t in completed for k in t.params.keys()})
 
@@ -417,28 +381,15 @@ def print_lm_results_table(study, objective_weights=None):
     header += " ".join(f"{p:<20}" for p in param_names)
     sep = "=" * len(header)
 
-    print(f"\nObjective weights: WER={wer_weight}, Time={time_weight}")
+    print(f"\nObjective: score = WER * {wer_weight} + Time * {time_weight}")
 
-    # Pareto front section
-    pareto_trials = [t for t in completed if t.number in pareto_numbers]
-    if pareto_trials:
-        print(f"\n{sep}")
-        print("PARETO FRONT (sorted by weighted score, best first)")
-        print(sep)
-        print(header)
-        print("-" * len(header))
-        for rank, trial in enumerate(pareto_trials, 1):
-            _print_trial_row(rank, trial, param_names, scores, pareto=True)
-
-    # All trials section
     print(f"\n{sep}")
-    print("ALL TRIALS (sorted by weighted score, best first)")
+    print("ALL TRIALS (sorted by score, best first)")
     print(sep)
     print(header)
     print("-" * len(header))
     for rank, trial in enumerate(completed, 1):
-        is_pareto = trial.number in pareto_numbers
-        _print_trial_row(rank, trial, param_names, scores, pareto=is_pareto)
+        _print_trial_row(rank, trial, param_names)
 
     print()
     pruned = [t for t in study.trials
@@ -447,16 +398,14 @@ def print_lm_results_table(study, objective_weights=None):
               if t.state == optuna.trial.TrialState.FAIL]
     print(f"Total trials: {len(study.trials)} | "
           f"Completed: {len(completed)} | "
-          f"Pareto-optimal: {len(pareto_numbers)} | "
           f"Pruned/Failed: {len(pruned) + len(failed)}")
 
 
-def _print_trial_row(rank, trial, param_names, scores, pareto=False):
+def _print_trial_row(rank, trial, param_names):
     """Print a single row of the results table."""
-    marker = "*" if pareto else " "
-    score = scores[trial.number]
-    wer = trial.values[0]
-    decode_time = trial.values[1]
+    score = trial.value
+    wer = trial.user_attrs.get("wer", float("nan"))
+    decode_time = trial.user_attrs.get("avg_decode_time", float("nan"))
     alpha = trial.user_attrs.get("best_alpha", "N/A")
     alpha_str = f"{alpha:<8.3f}" if isinstance(alpha, float) else f"{alpha:<8}"
     params_str = " ".join(
@@ -465,7 +414,7 @@ def _print_trial_row(rank, trial, param_names, scores, pareto=False):
     config_label = ""
     if "initial_config_name" in trial.user_attrs:
         config_label = f" [{trial.user_attrs['initial_config_name']}]"
-    print(f"{rank:<4}{marker} {trial.number:<7} {score:<10.5f} {wer:<10.5f} {decode_time:<10.4f} "
+    print(f"{rank:<5} {trial.number:<7} {score:<10.5f} {wer:<10.5f} {decode_time:<10.4f} "
           f"{alpha_str}{params_str}{config_label}")
 
 
@@ -520,11 +469,9 @@ def main():
             study_name=sweep_cfg.study_name,
             storage=storage,
             sampler=sampler,
-            directions=["minimize", "minimize"],  # WER, decode_time
+            direction="minimize",
             load_if_exists=False,
         )
-
-    study.set_metric_names(["WER", "Avg Decode Time (s)"])
 
     is_grid = sweep_cfg.search_strategy.lower() == "grid"
     if initial_configs and not is_grid:
@@ -551,9 +498,8 @@ def main():
                     if n_initial_configs > 0 and not is_grid else "")
     print(f"Strategy: {sweep_cfg.search_strategy} | Trials: {n_trials} | "
           f"Concurrent jobs: {total_jobs}{initial_info}")
-    print(f"Objectives: minimize WER, minimize decode time")
-    print(f"Objective weights: WER={sweep_cfg.objective_weights.wer}, "
-          f"Time={sweep_cfg.objective_weights.time}")
+    print(f"Objective: minimize score = WER * {sweep_cfg.objective_weights.wer} "
+          f"+ Time * {sweep_cfg.objective_weights.time}")
     print(f"Output: {sweep_cfg.output_dir}")
     print(f"DB: {db_path}\n")
 
@@ -573,37 +519,17 @@ def main():
     generate_lm_visualizations(study, sweep_cfg.output_dir)
 
     # Summary
-    pareto = study.best_trials
     completed = [t for t in study.trials
                  if t.state == optuna.trial.TrialState.COMPLETE]
     print(f"\nSweep complete!")
     print(f"  SQLite DB: {db_path}")
     print(f"  Output dir: {sweep_cfg.output_dir}")
-    print(f"  Pareto-optimal trials: {len(pareto)}")
-    if pareto:
-        # Show the Pareto trial with lowest WER
-        best_wer_trial = min(pareto, key=lambda t: t.values[0])
-        print(f"  Lowest WER on Pareto front: Trial {best_wer_trial.number} "
-              f"(WER={best_wer_trial.values[0]:.5f}, "
-              f"Time={best_wer_trial.values[1]:.4f}s)")
-        # Show the Pareto trial with fastest decode time
-        best_time_trial = min(pareto, key=lambda t: t.values[1])
-        print(f"  Fastest on Pareto front:    Trial {best_time_trial.number} "
-              f"(WER={best_time_trial.values[0]:.5f}, "
-              f"Time={best_time_trial.values[1]:.4f}s)")
     if completed:
-        # Show best trial by weighted score
-        scores = _compute_weighted_scores(
-            completed,
-            float(sweep_cfg.objective_weights.wer),
-            float(sweep_cfg.objective_weights.time),
-        )
-        best_score_num = min(scores, key=scores.get)
-        best_score_trial = next(t for t in completed if t.number == best_score_num)
-        print(f"  Best weighted score:        Trial {best_score_num} "
-              f"(Score={scores[best_score_num]:.5f}, "
-              f"WER={best_score_trial.values[0]:.5f}, "
-              f"Time={best_score_trial.values[1]:.4f}s)")
+        best = study.best_trial
+        print(f"  Best trial: {best.number} "
+              f"(Score={best.value:.5f}, "
+              f"WER={best.user_attrs['wer']:.5f}, "
+              f"Time={best.user_attrs['avg_decode_time']:.4f}s)")
     print(f"\nTo explore interactively:")
     print(f"  pip install optuna-dashboard")
     print(f"  optuna-dashboard sqlite:///{db_path}")

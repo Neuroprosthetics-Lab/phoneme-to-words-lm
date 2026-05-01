@@ -286,8 +286,8 @@ def main():
         cache_dir=cache_dir,
         dtype=torch.bfloat16,
         device_map="auto",
-        use_cache=False,
     )
+    model.config.use_cache = False
 
     # ---- Baseline Perplexity ----
     if val_sentences:
@@ -353,7 +353,7 @@ def main():
         report_to="none",
         seed=args.seed,
         dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
+        max_length=args.max_seq_length,
         packing=False,
     )
 

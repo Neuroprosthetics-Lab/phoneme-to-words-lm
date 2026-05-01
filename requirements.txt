@@ -23,14 +23,18 @@ safetensors==0.7.0
 tokenizers==0.22.2
 
 # LLM finetuning
-peft>=0.15.0
-trl>=0.18.0
+peft==0.19.1
+trl==1.3.0
 datasets>=3.0.0
 
 # Hyperparameter optimization
 optuna==4.8.0
 optuna-dashboard==0.20.0
 plotly==6.6.0
+
+# N-gram LM training pipeline (text normalization for ngram/train_ngram_lm.py)
+num2words>=0.5.13
+nltk>=3.9
 
 # Jupyter
 jupyter

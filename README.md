@@ -17,26 +17,7 @@ This package replaces the standard n-gram WFST decoding pipeline (Kaldi + OpenFS
 | **Hardware requirement** | Workstation / server | Consumer GPU |
 | **Codebase** | Python + C++ (Kaldi, OpenFST) | Python + PyTorch + Flashlight-Text |
 
-Additional capabilities:
-- **LLM rescoring** with efficient GPU batch processing over large n-best lists (e.g., 100 hypotheses)
-- **LoRA finetuning** of the rescoring LLM on domain-specific text for improved accuracy
-- **Online (streaming) decoding** for real-time applications
-- **Optuna hyperparameter sweep** with multi-objective optimization (WER + decode speed)
-- Fast enough to be used to get validation WER feedback during training/finetuning of the acoustic model, enabling new possibilities for end-to-end optimization and avoiding overfitting on PER.
-
-## Table of Contents
-
-- [Installation](#installation)
-- [HuggingFace Cache Configuration](#huggingface-cache-configuration)
-- [KenLM File Setup](#kenlm-file-setup)
-- [Quick Start](#quick-start)
-- [Logit Preprocessing](#logit-preprocessing)
-- [Hyperparameters](#hyperparameters)
-- [LLM Rescoring](#llm-rescoring)
-- [Online Decoding](#online-decoding)
-- [LLM Finetuning](#llm-finetuning)
-- [Hyperparameter Sweep](#hyperparameter-sweep)
-- [Fake Logits Demo](#fake-logits-demo)
+Additional capabilities: LLM rescoring with GPU batch processing over n-best lists, LoRA finetuning of the rescoring LLM, online (streaming) decoding, Optuna hyperparameter sweeps, hotword biasing, and contextual rescoring. Fast enough to get validation WER feedback during acoustic-model training instead of relying on PER.
 
 ## Installation
 
@@ -59,13 +40,7 @@ This creates a `phoneme_lm` conda environment with PyTorch, flashlight-text (bun
 
 ### Manual installation
 
-If you already have an environment with PyTorch, kenLM, flashlight-text, and the optional GPU acceleration packages, you can skip the setup script and just install the package:
-
-```bash
-pip install -e .
-```
-
-Note: flashlight-text requires a source modification because phoneme sequence homophones can exceed the default max trie label length of 6. The bundled `flashlight_text/` directory has this patch pre-applied. Install it with:
+If you already have PyTorch, KenLM, and the GPU packages, just `pip install -e .`. You also need the bundled `flashlight_text/` (it has a `kTrieMaxLabel = 60` patch — phoneme homophones can exceed the upstream default of 6):
 
 ```bash
 pip install ./flashlight_text --no-build-isolation
@@ -107,113 +82,9 @@ paths = download_5gram_files(output_dir='/path/to/lm_files', pruned=False)
 
 ### Build your own files
 
-Note: you could conceivably use any tokenization scheme you want, but here we focus on phoneme-level decoding with a standard ARPAbet phoneme set and a 5gram model trained on openwebtext2. The instructions below assume you are starting with a WFST lexicon and an ARPA n-gram language model.
+Use the n-gram training pipeline under `ngram/` — it produces `lm.bin`, `lexicon.txt`, and `tokens.txt` ready for the decoder. See [N-gram Training](#n-gram-training) below and `ngram/README.md` for the full walkthrough.
 
-### 1. Build KenLM from source
-
-You need the `build_binary` CLI tool to compile `.arpa` files into the efficient `.bin` format. The easiest way is via vcpkg:
-
-```bash
-git clone https://github.com/Microsoft/vcpkg.git
-cd vcpkg
-./bootstrap-vcpkg.sh
-./vcpkg integrate install
-./vcpkg install kenlm
-```
-
-After installation, `build_binary` will be at:
-```
-vcpkg/installed/x64-linux/tools/kenlm/build_binary
-```
-
-### 2. Compile the language model
-
-Start with an `.arpa` file and compile it to `.bin`:
-
-```bash
-build_binary PATH/TO/INPUT.arpa PATH/TO/OUTPUT.bin
-```
-
-### 3. Convert the lexicon
-
-Convert a WFST lexicon to Flashlight-Text format (`WORD P1 P2 P3 SIL`). Note that SIL is appended to the end of every pronunciation:
-
-```python
-import re
-VARIANT_RE = re.compile(r"\(\d+\)$")
-
-source_file = '/path/to/wfst/lexicon.txt'
-output = '/path/to/kenlm/lexicon.txt'
-
-with open(source_file, 'r') as f:
-    lines = f.readlines()
-lines.sort()
-
-reformatted_lines = []
-for line in lines:
-    parts = line.strip().split()
-    word = parts[0]
-    # remove variant suffixes like '(1)', '(2)', etc.
-    word = VARIANT_RE.sub('', word)
-    phones = ' '.join(parts[1:])
-    phones += ' SIL'  # Append 'SIL' to the end of the phones
-    reformatted_lines.append(f"{word} {phones}\n")
-
-with open(output, 'w') as f:
-    f.writelines(reformatted_lines)
-```
-
-### 4. Create `tokens.txt`
-
-List all tokens, one per line. **The order matters** — it must be `BLANK, SIL, AA..ZH`:
-
-```
-BLANK
-SIL
-AA
-AE
-AH
-AO
-AW
-AY
-B
-CH
-D
-DH
-EH
-ER
-EY
-F
-G
-HH
-IH
-IY
-JH
-K
-L
-M
-N
-NG
-OW
-OY
-P
-R
-S
-SH
-T
-TH
-UH
-UW
-V
-W
-Y
-Z
-ZH
-```
-
-### 5. Organize files
-
-Your `lm.bin`, `lexicon.txt`, and `tokens.txt` should all go into one folder.
+If you instead have a pre-built ARPA model and a WFST-format lexicon, you'll need to (1) compile the ARPA with KenLM's `build_binary`, (2) reformat the lexicon to `WORD P1 P2 P3 SIL` (one entry per word, SIL appended), and (3) write a `tokens.txt` with one token per line in the order `BLANK, SIL, AA..ZH` (the standard ARPAbet 39-phoneme set). All three files go in one folder.
 
 ## Quick Start
 
@@ -239,13 +110,7 @@ print(results[0]['word_seqs'][0])  # best hypothesis
 
 ## Logit Preprocessing
 
-The decoder internally handles temperature scaling, log-softmax conversion, and blank penalty application (via the `temperature`, `blank_penalty` constructor parameters). You only need to ensure your logit tokens are in the correct order before passing them to the decoder.
-
-### Token order
-
-The decoder expects logits with tokens ordered to match `tokens.txt`: `[BLANK, SIL, AA..ZH]`.
-
-If your model outputs logits in the order `[BLANK, AA..ZH, SIL]` (BLANK at index 0, SIL at the end), rearrange before decoding:
+The decoder applies temperature scaling, log-softmax, and the blank penalty internally (via the `temperature` and `blank_penalty` constructor args). You only need to make sure logit tokens are ordered to match `tokens.txt`: `[BLANK, SIL, AA..ZH]`. If your model emits `[BLANK, AA..ZH, SIL]`, swap SIL to position 1 first:
 
 ```python
 logits = torch.concat((logits[:, :, 0:1], logits[:, :, -1:], logits[:, :, 1:-1]), dim=-1)
@@ -295,21 +160,9 @@ final_score = acoustic_score + (lm_weight * ngram_score) + (llm_alpha * llm_scor
 
 ## LLM Rescoring
 
-Rescore the n-best beam search hypotheses with a causal LLM for improved accuracy.
+Rescore the n-best beam search hypotheses with a causal LLM. Each candidate is preprocessed (punctuation removal, word replacement), batch-scored by the LLM (sum of per-token log-probabilities, with optional `llm_length_penalty`), and combined with the beam score: `beam_score + llm_alpha * llm_score`.
 
-### How it works
-
-1. The beam search decoder returns `n_best` candidate sentences
-2. Each candidate is preprocessed with `remove_punctuation()` and `replace_words()`
-3. Candidates are batched and scored by the LLM (sum of per-token log-probabilities)
-4. An optional `llm_length_penalty` can be subtracted per-token
-5. Final scores combine beam scores with weighted LLM scores: `beam_score + llm_alpha * llm_score`
-
-### Model setup
-
-The LLM is loaded via HuggingFace's `transformers` library. Currently using **Qwen3.5-4B** (~8-10 GB GPU memory in bfloat16). You can swap in other sizes or model families.
-
-### Example
+The LLM is loaded via HuggingFace `transformers`. Default is **Qwen3.5-4B** (~8-10 GB in bfloat16); swap in any causal LM.
 
 ```python
 decoder = KenLMFlashlightTextLM(
@@ -325,25 +178,99 @@ decoder = KenLMFlashlightTextLM(
 )
 ```
 
+## Contextual Rescoring
+
+Pass context strings (previous sentences, domain hints, keywords, etc.) to condition the LLM during rescoring. Context is prepended to each n-best hypothesis (only the hypothesis tokens are scored) and applied only at the LLM stage, not the n-gram beam search.
+
+### Offline decoding with context
+
+`offline_decode()` accepts a `contexts` list with one string per batch item:
+
+```python
+results = decoder.offline_decode(
+    batched_logits,    # shape (B, T, num_tokens)
+    batched_lengths,
+    contexts=[
+        "the patient reported chest pain",       # context for batch item 0
+        "we need two cups of flour and an egg",  # context for batch item 1
+    ],
+)
+```
+
+### Online (streaming) decoding with context
+
+`online_decode_end()` accepts a single `context` string:
+
+```python
+ctx = ""
+for utterance_logits in utterance_stream:
+    decoder.online_decode_begin()
+    for frame_logits in utterance_logits:
+        decoder.online_decode_step(frame_logits)
+    # Pass previous decoded sentences as context
+    final = decoder.online_decode_end(context=ctx)
+    ctx = ctx + " " + final['word_seqs'][0]  # accumulate for next utterance
+```
+
+### Example context formats
+
+The LLM sees raw text, so any sensible English prefix works — previous sentences, a `domain: cooking\n` hint, a `keywords: ...\n` line, multi-turn dialogue, or a combination:
+
+```python
+context = "previous: i need two cups of flour\ncurrent: "
+context = "domain: cooking\nkeywords: flour oven baking\n"
+```
+
+The base LLM uses context without retraining; LoRA-finetuning on context-prefixed pairs improves utilization further. Keep contexts to a few recent sentences — long contexts grow memory and latency.
+
+## Hotword Biasing
+
+Boost the n-gram probability of specific words at decode time without retraining the LM — useful for names, jargon, and domain vocabulary the LM has seen weakly or not at all. Each hotword gets a log10 bonus added to the KenLM score at word completion, plus a trie lookahead seed so partial-word paths survive beam pruning. The KenLM itself is never modified.
+
+### Constraints
+
+- Hotwords must already exist in `lexicon.txt` (no g2p fallback — the decoder raises `KeyError` listing missing words). Add them to the lexicon and rebuild.
+- Bonuses are log10. `+1.0` ≈ 10× boost; useful range is `1.0`–`5.0`. The trie-side lookahead bias is capped at 5.0.
+
+### Initial hotwords
+
+Pass either an inline mapping or a YAML file path:
+
+```python
+decoder = KenLMFlashlightTextLM(
+    lexicon_path='/path/to/lexicon.txt',
+    tokens_path='/path/to/tokens.txt',
+    kenlm_model_path='/path/to/lm.bin',
+    hotwords={'alpha': 4.0, 'bravo': 4.0, 'nato': 2.5},
+)
+# or
+decoder = KenLMFlashlightTextLM(
+    ...,
+    hotwords_path='examples/example_hotwords.yaml',
+)
+```
+
+The YAML file is a flat top-level mapping of `word: bonus`. See `examples/example_hotwords.yaml` for a template.
+
+### Runtime updates
+
+```python
+decoder.set_hotwords({'alpha': 4.0, 'bravo': 4.0})  # replace active set
+decoder.get_hotwords()                              # currently-applied mapping
+decoder.clear_hotwords()                            # remove all
+```
+
+`set_hotwords` is *deferred* — changes apply at the next utterance boundary. Changing the *set* of hotwords rebuilds the trie/decoder (a few seconds for a 312k-entry lexicon); changing only the *bonuses* is essentially free. The KenLM is reused either way.
+
 ## Online Decoding
 
-`KenLMFlashlightTextLM` supports real-time streaming decoding via flashlight's incremental beam search API.
-
-### API
-
-1. **`online_decode_begin()`** -- Initialize decoder state for a new utterance.
-2. **`online_decode_step(logits)`** -- Feed new frame(s) and get the current best sentence. Input: raw logits, shape `(T, num_tokens)` or `(1, T, num_tokens)`.
-3. **`online_decode_end()`** -- Finalize decoding, get full n-best list with optional LLM rescoring.
-
-### Example
+`KenLMFlashlightTextLM` supports real-time streaming via flashlight's incremental beam search. Use `online_decode_begin()` to start an utterance, `online_decode_step(logits)` to feed frame(s) and read the current best sentence (input shape `(T, num_tokens)` or `(1, T, num_tokens)`), and `online_decode_end()` to finalize and get the full n-best list with optional LLM rescoring.
 
 ```python
 decoder.online_decode_begin()
-
 for frame_logits in logit_stream:
     result = decoder.online_decode_step(frame_logits)
     print(f"[{result['total_frames']} frames] {result['word_seq']}")
-
 final = decoder.online_decode_end()
 print(f"Final: {final['word_seqs'][0]}")
 ```
@@ -364,15 +291,9 @@ python -m phoneme_to_words_lm.finetune_llm \
     --lora-alpha 32
 ```
 
-The script:
-- Loads sentences from one or more source files (e.g., Switchboard corpus)
-- Processes sentences - lowercasing, punctuation removal, word replacement (e.g., "ok" -> "okay")
-- Deduplicates and upsamples per-source
-- Trains LoRA adapters on the base LLM
-- Evaluates perplexity on a validation split during training
-- Saves the best adapter checkpoint
+The script loads sentences from one or more source files, normalizes them (lowercase, punctuation removal, word replacement), deduplicates and upsamples per-source, trains LoRA adapters on the base LLM with held-out perplexity evaluation, and saves the best checkpoint.
 
-Use the resulting adapter with the decoder via `llm_lora_path`:
+Use the resulting adapter via `llm_lora_path`:
 
 ```python
 decoder = KenLMFlashlightTextLM(
@@ -381,9 +302,25 @@ decoder = KenLMFlashlightTextLM(
 )
 ```
 
+## N-gram Training
+
+To build your own KenLM `.bin` from scratch, use the pipeline under `ngram/`. It supports word-level and character-level (spelling) LMs, multiple corpora with weighted interpolation, and per-corpus n-gram orders. The pipeline normalizes raw text, trains per-corpus models with `lmplz`, optionally interpolates (SRILM `ngram` or KenLM `interpolate`), and emits `lm.bin` + `lexicon.txt` + `tokens.txt` ready for the decoder. Defaults to the bundled CMU dict.
+
+```bash
+conda activate phoneme_lm
+cd ngram
+python train_ngram_lm.py --config example_config.yaml
+```
+
+See `ngram/README.md` for the full config reference, prerequisites (including how to build KenLM's `interpolate` binary, which `vcpkg install kenlm` does not provide), and worked examples.
+
 ## Hyperparameter Sweep
 
-Multi-objective Optuna sweep for the LM decoder, optimizing both WER and decode time:
+Optuna sweep for the LM decoder, optimizing a weighted single-objective combining WER and decode time:
+
+```
+score = wer_weight * wer + time_weight * avg_decode_time   (lower is better)
+```
 
 ```bash
 # Single GPU sweep
@@ -399,7 +336,7 @@ python sweep/lm_sweep.py --sweep_config sweep/example_lm_sweep.yaml --devices cu
 python sweep/lm_sweep.py --sweep_config sweep/example_lm_sweep.yaml --resume
 ```
 
-See `sweep/example_lm_sweep.yaml` for TPE search and `sweep/example_lm_sweep_grid.yaml` for exhaustive grid search. The sweep requires a pkl file of precomputed phoneme logits (logits + transcriptions).
+See `sweep/example_lm_sweep.yaml` for TPE search and `sweep/example_lm_sweep_grid.yaml` for exhaustive grid search. The sweep requires a pkl file of precomputed phoneme logits (logits + transcriptions). The `objective_weights` block in the sweep config controls the WER/time balance.
 
 For interactive exploration of results:
 

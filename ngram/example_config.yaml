@@ -1,0 +1,157 @@
+# N-gram LM training config for phoneme-to-words decoding.
+#
+# Usage:
+#   python train_ngram_lm.py --config example_config.yaml [--verbose]
+#
+# Output: lm_unpruned.bin, lexicon.txt, tokens.txt, lm.arpa
+#         plus normalized/ and (arpa/ | intermediate/) subdirectories with
+#         per-corpus artifacts. Which of arpa/ or intermediate/ is populated
+#         depends on interpolator_backend below.
+
+# ---- Output ----
+# Directory where all output files are written.
+output_dir: ~/lm_output/my_5gram
+
+# ---- LM type ----
+# "word"     - word-level n-gram. Uses cmu_dict_path for the lexicon.
+# "spelling" - character-level n-gram for letter-by-letter spelling mode.
+#              Training text is expanded to one character-separated word per line.
+lm_type: word
+
+# ---- Memory ----
+# Memory limit for lmplz (and for KenLM interpolate's sort buffer when
+# interpolator_backend=kenlm). Can be a percentage ("80%") or absolute ("8G").
+memory: "80%"
+
+# ---- Normalization parallelism ----
+# Number of worker processes used during text normalization. Omit or set to
+# null to auto-detect (min(cpu_count, 16)). Set to 1 to run serially (useful
+# for debugging or deterministic output order). Parallel mode is ~15-20x
+# faster than serial on multi-GB corpora; output line order is not preserved
+# but the n-gram counts produced by lmplz are unaffected.
+# normalize_workers: null
+
+# ---- Interpolator backend (REQUIRED) ----
+# Which tool to use for mixing the per-corpus LMs into the final interpolated
+# model. Two choices:
+#
+#   srilm - SRILM's `ngram -mix-lm`. Produces per-corpus ARPAs via lmplz,
+#           then loads all of them into RAM simultaneously to interpolate.
+#           Simple and well-understood but does not scale: for many-corpus
+#           configs with tens of GB of ARPAs, this can exhaust memory and
+#           take 10+ hours (or get OOM-killed).
+#
+#   kenlm - KenLM's streaming `interpolate`. Produces per-corpus
+#           intermediate files via `lmplz --intermediate` (no ARPAs), then
+#           sort-merges them on disk. Peak RAM is bounded by the sort
+#           buffer (`memory` above), not total model size. Much faster and
+#           lighter on RAM for large corpus sets.
+#
+# Notes:
+# - Switching backends requires re-running lmplz for every corpus: ARPA and
+#   intermediate formats are not interconvertible. You can still reuse
+#   already-normalized text via `normalized_path` to skip the slow
+#   normalization step.
+# - `interpolator_backend` is REQUIRED; there is no default.
+interpolator_backend: srilm
+
+# ---- Corpora ----
+# List of training corpora. Each corpus is trained as a separate n-gram model,
+# then interpolated using the chosen backend if there are multiple.
+#
+# Source priority (mutually exclusive, highest priority first):
+#   arpa_path          - (srilm only) Use an existing .arpa file
+#                        (skip normalization + training)
+#   intermediate_path  - (kenlm only) Use an existing lmplz --intermediate
+#                        prefix (skip normalization + training)
+#   normalized_path    - Use already-normalized text (skip normalization)
+#   path               - Raw text file (full pipeline: normalize -> train)
+#
+# `path` and `normalized_path` may be either a single string or a list of
+# strings. When a list is provided, all files are concatenated into one
+# normalized text file before training (each input is normalized first, then
+# the results are joined). This is useful for grouping related corpora into
+# a single ARPA before interpolation. `arpa_path` is always a single file.
+#
+# Each corpus has its own order and optional pruning.
+# Weights are unnormalized -- they are auto-scaled to sum to 1.0.
+#   e.g., weight: 1, weight: 2 -> 0.333, 0.667
+#
+# Each corpus also gets a `name` that is used for the intermediate file names
+# (normalized/<name>.txt and arpa/<name>.arpa). If omitted, the name is derived
+# from the source file's basename (e.g., /path/to/raw_switchboard.txt -> raw_switchboard).
+# `name` is REQUIRED when `path` or `normalized_path` is a list.
+# Names must match [A-Za-z0-9][A-Za-z0-9_.-]* and be unique across corpora.
+corpora:
+  - name: general_english            # optional; derived from filename if omitted
+    path: /path/to/general_english_corpus.txt
+    weight: 5
+    order: 5
+    # Per-order count-based pruning thresholds.
+    # Length must match order. Each value is the minimum n-gram count to keep.
+    #   0 = keep all (required for unigrams)
+    #   1 = keep all (count is always >= 1)
+    #   2 = discard n-grams that appeared only once
+    # Higher orders are typically pruned more aggressively.
+    pruning: [0, 0, 1, 1, 2]
+
+  - name: domain_specific
+    path: /path/to/domain_specific_corpus.txt
+    weight: 1
+    order: 3
+    pruning: null  # null = no pruning
+
+  # Example: group several files into one ARPA before interpolation.
+  # Files are normalized individually, then concatenated. The group's weight
+  # applies to the merged ARPA; each file's contribution within the group is
+  # proportional to its token count.
+  # - name: conversational
+  #   path:
+  #     - /path/to/raw_dailydialog.txt
+  #     - /path/to/raw_switchboard.txt
+  #   weight: 2
+  #   order: 5
+  #   pruning: [0, 0, 1, 1, 2]
+
+  # Example: reuse a previously trained ARPA file (srilm backend only).
+  # - arpa_path: /path/to/old_model/arpa/corpus_0.arpa
+  #   weight: 2
+  #   order: 5
+
+  # Example: reuse previously trained KenLM intermediate files
+  # (kenlm backend only). `intermediate_path` is a file prefix --
+  # lmplz wrote <prefix>.1..N plus <prefix>.vocab and
+  # <prefix>.kenlm_intermediate alongside it.
+  # - intermediate_path: /path/to/old_model/intermediate/corpus_0
+  #   weight: 2
+  #   order: 5
+
+  # Example: reuse a pre-normalized text file.
+  # - normalized_path: /path/to/old_model/normalized/corpus_0.txt
+  #   weight: 1
+  #   order: 3
+
+# ---- Tool paths ----
+# Command name (if on PATH) or absolute path to each binary.
+lmplz_path: lmplz
+build_binary_path: build_binary
+srilm_ngram_path: ngram          # Only needed when interpolator_backend=srilm
+                                 # and there is more than one corpus.
+kenlm_interpolate_path: interpolate  # Only needed when interpolator_backend=kenlm
+                                     # and there is more than one corpus.
+                                     # Built from the kenlm source tree -- it is
+                                     # NOT included in the vcpkg KenLM build.
+
+# ---- CMU pronunciation dictionary ----
+# Only used for lm_type: word. Maps words to phoneme sequences for lexicon.txt.
+# When omitted (or null), defaults to the cmu_dict.pkl bundled with the
+# phoneme_to_words_lm package.
+# cmu_dict_path: null
+
+# ---- English word list (optional) ----
+# Only used for lm_type: word. One lowercase word per line.
+# When provided, OOV words (not in CMU dict) must appear in this list before
+# being phonemized by g2p-en; otherwise they're dropped from the lexicon.
+# This filters out misspellings, concatenated tokens, and garbage strings.
+# Omit or set to null to drop every OOV (no g2p-en fallback).
+# english_words_path: /path/to/english_word_list.txt

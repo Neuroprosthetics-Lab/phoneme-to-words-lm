@@ -1,0 +1,19 @@
+# Hotword bonuses for n-gram LM biasing.
+#
+# Format: top-level mapping of word -> log10 bonus (float).
+#   - Words must be lowercase and present in the KenLM lexicon.
+#     The decoder raises KeyError listing any word that isn't, with no
+#     g2p fallback. Add unknown words to the lexicon first.
+#   - Each +1.0 of bonus is ~10x boost in log10 space.
+#     Typical useful range is 1.0 to 5.0; values much above ~5 may not
+#     help further because the trie-side lookahead bias caps at 5.0.
+#
+# Loaded via the `hotwords_path` parameter on KenLMFlashlightTextLM. Copy
+# this file, rename it (e.g. nato_hotwords.yaml, medical_hotwords.yaml),
+# edit, and pass the path when constructing the decoder.
+
+# --- Examples (replace with your actual list) ---
+# alpha: 4.0
+# bravo: 4.0
+# nato: 2.5
+# braingate: 0.5

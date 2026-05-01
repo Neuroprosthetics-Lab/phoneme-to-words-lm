@@ -22,16 +22,24 @@ def _build_grid_search_space(parameters):
         elif ptype == "fixed":
             search_space[name] = [spec["value"]]
         elif ptype == "float_range":
-            n_pts = spec.get("n_grid_points", 5)
             low, high = spec["low"], spec["high"]
-            if spec.get("log", False):
-                search_space[name] = list(np.geomspace(low, high, n_pts))
+            step = spec.get("step", None)
+            if step is not None:
+                # Use step to generate discrete grid points
+                search_space[name] = list(np.arange(low, high + step / 2, step))
             else:
-                search_space[name] = list(np.linspace(low, high, n_pts))
+                n_pts = spec.get("n_grid_points", 5)
+                if spec.get("log", False):
+                    search_space[name] = list(np.geomspace(low, high, n_pts))
+                else:
+                    search_space[name] = list(np.linspace(low, high, n_pts))
         elif ptype == "int_range":
-            n_pts = spec.get("n_grid_points", None)
             low, high = spec["low"], spec["high"]
-            if n_pts is not None:
+            step = spec.get("step", None)
+            n_pts = spec.get("n_grid_points", None)
+            if step is not None:
+                search_space[name] = list(range(low, high + 1, step))
+            elif n_pts is not None:
                 import math
                 step = max(1, math.ceil((high - low) / (n_pts - 1)))
                 search_space[name] = list(range(low, high + 1, step))
@@ -83,6 +91,15 @@ def encode_param_value(name: str, spec, value):
                 f"initial_configs: value {fval} for '{name}' is outside "
                 f"range [{spec['low']}, {spec['high']}]"
             )
+        step = spec.get("step", None)
+        if step is not None:
+            # Check value aligns with step grid (with floating point tolerance)
+            offset = (fval - spec["low"]) / step
+            if abs(offset - round(offset)) > 1e-9:
+                raise ValueError(
+                    f"initial_configs: value {fval} for '{name}' does not align "
+                    f"with step={step} from low={spec['low']}"
+                )
         return fval, False
 
     elif ptype == "int_range":
@@ -91,6 +108,12 @@ def encode_param_value(name: str, spec, value):
             raise ValueError(
                 f"initial_configs: value {ival} for '{name}' is outside "
                 f"range [{spec['low']}, {spec['high']}]"
+            )
+        step = spec.get("step", None)
+        if step is not None and (ival - spec["low"]) % step != 0:
+            raise ValueError(
+                f"initial_configs: value {ival} for '{name}' does not align "
+                f"with step={step} from low={spec['low']}"
             )
         return ival, False
 
@@ -154,9 +177,13 @@ def suggest_param(trial, name: str, spec):
                 pass
         return result
     elif ptype == "float_range":
-        return trial.suggest_float(name, spec["low"], spec["high"], log=spec.get("log", False))
+        step = spec.get("step", None)
+        log = spec.get("log", False)
+        if step is not None and log:
+            raise ValueError(f"Parameter '{name}': 'step' and 'log' cannot both be set for float_range")
+        return trial.suggest_float(name, spec["low"], spec["high"], step=step, log=log)
     elif ptype == "int_range":
-        return trial.suggest_int(name, spec["low"], spec["high"])
+        return trial.suggest_int(name, spec["low"], spec["high"], step=spec.get("step", 1))
     elif ptype == "boolean":
         return trial.suggest_categorical(name, [False, True])
     else:
