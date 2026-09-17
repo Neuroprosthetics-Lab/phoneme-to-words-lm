@@ -15,6 +15,7 @@
 #include "flashlight/lib/text/decoder/LexiconFreeSeq2SeqDecoder.h"
 #include "flashlight/lib/text/decoder/LexiconSeq2SeqDecoder.h"
 #include "flashlight/lib/text/decoder/Utils.h"
+#include "flashlight/lib/text/decoder/lm/HotwordLM.h"
 #include "flashlight/lib/text/decoder/lm/ZeroLM.h"
 
 namespace py = pybind11;
@@ -198,6 +199,15 @@ PYBIND11_MODULE(flashlight_lib_text_decoder, m) {
       .def("child", &LMState::child<LMState>, "usr_index"_a);
 
   py::class_<ZeroLM, ZeroLMPtr, LM>(m, "ZeroLM").def(py::init<>());
+
+  py::class_<HotwordLM, HotwordLMPtr, LM>(m, "HotwordLM")
+      .def(
+          py::init<LMPtr, HotwordLM::Bonuses>(),
+          "inner"_a,
+          "hotword_bonus"_a = HotwordLM::Bonuses{},
+          py::keep_alive<1, 2>())
+      .def_property(
+          "hotword_bonus", &HotwordLM::getHotwordBonus, &HotwordLM::setHotwordBonus);
 
   py::enum_<CriterionType>(m, "CriterionType")
       .value("ASG", CriterionType::ASG)

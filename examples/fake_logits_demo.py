@@ -25,11 +25,11 @@ from phoneme_to_words_lm import KenLMFlashlightTextLM
 from phoneme_to_words_lm.utils import phonemize_sentence, LOGIT_PHONE_DEF
 
 
-def create_fake_logits(text, g2p, noise_std):
+def create_fake_logits(text, g2p, noise_std, seed=42, logit_margin=8.0):
     """Create synthetic phoneme logits for a given sentence.
 
     Phonemizes the sentence, then builds a logit matrix where each time step
-    has a high value (100) at the correct phoneme index and zeros elsewhere.
+    has a configurable margin (default 8) at the correct phoneme index.
     Blank frames are inserted between phonemes and at the start/end.
     Gaussian noise is added to simulate imperfect neural decoding.
 
@@ -37,35 +37,39 @@ def create_fake_logits(text, g2p, noise_std):
         text: Sentence to phonemize and encode.
         g2p: A g2p_en.G2p instance for grapheme-to-phoneme conversion.
         noise_std: Standard deviation of Gaussian noise added to logits.
+        seed: Seed for blank placement and Gaussian noise.
+        logit_margin: Correct-token logit before adding noise.
 
     Returns:
         numpy array of shape (T, num_tokens) where num_tokens = len(LOGIT_PHONE_DEF).
     """
     phonemes = phonemize_sentence(text, g2p=g2p)
+    rng = np.random.default_rng(seed)
 
     # create fake logits that correspond to the phonemes
     logits = []
     for i in range(3):
         # add 3 blanks to the start
         logits.append(np.zeros(len(LOGIT_PHONE_DEF)))
-        logits[-1][LOGIT_PHONE_DEF.index('BLANK')] = 100
+        logits[-1][LOGIT_PHONE_DEF.index('BLANK')] = logit_margin
     for i, p in enumerate(phonemes):
         # loop through phonemes
         logits.append(np.zeros(len(LOGIT_PHONE_DEF)))
-        logits[-1][LOGIT_PHONE_DEF.index(p)] = 100
-        for i in range(np.random.randint(0, 2)):
+        logits[-1][LOGIT_PHONE_DEF.index(p)] = logit_margin
+        n_blanks = 1 if i + 1 < len(phonemes) and p == phonemes[i+1] else rng.integers(0, 2)
+        for _ in range(n_blanks):
             # add up to 1 blank between phonemes
             logits.append(np.zeros(len(LOGIT_PHONE_DEF)))
-            logits[-1][LOGIT_PHONE_DEF.index('BLANK')] = 100
+            logits[-1][LOGIT_PHONE_DEF.index('BLANK')] = logit_margin
     # add one more blank at the end
     logits.append(np.zeros(len(LOGIT_PHONE_DEF)))
-    logits[-1][LOGIT_PHONE_DEF.index('BLANK')] = 100
+    logits[-1][LOGIT_PHONE_DEF.index('BLANK')] = logit_margin
 
     # convert to numpy array
     logits = np.array(logits)
 
     # add white noise
-    logits += np.random.normal(0, noise_std, logits.shape)
+    logits += rng.normal(0, noise_std, logits.shape)
 
     return logits
 
@@ -83,6 +87,8 @@ def main():
                         help="Sentence to encode as fake logits (default: 'hello how are you')")
     parser.add_argument("--noise_std", type=float, default=3.0,
                         help="Std dev of Gaussian noise added to logits (default: 3.0)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--logit_margin", type=float, default=8.0)
     parser.add_argument("--n_best", type=int, default=10,
                         help="Number of top hypotheses to display (default: 10)")
     args = parser.parse_args()
@@ -97,7 +103,8 @@ def main():
     print(f"Phonemes: {' '.join(phonemes)}")
 
     # Create fake logits
-    logits_np = create_fake_logits(args.text, g2p, args.noise_std)
+    logits_np = create_fake_logits(args.text, g2p, args.noise_std,
+                                   seed=args.seed, logit_margin=args.logit_margin)
     print(f"Logit shape: {logits_np.shape} (T={logits_np.shape[0]}, tokens={logits_np.shape[1]})")
     print()
 

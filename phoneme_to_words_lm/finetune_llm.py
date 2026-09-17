@@ -5,19 +5,23 @@ import argparse
 import json
 import math
 import os
-import re
+import hashlib
+import random
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
 import torch
-from datasets import Dataset
-from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
-from peft import LoraConfig, TaskType
-from trl import SFTTrainer, SFTConfig
 
-from phoneme_to_words_lm.utils import HF_CACHE_DIR
+from phoneme_to_words_lm.utils import HF_CACHE_DIR, TEXT_NORMALIZATION_VERSION
+from phoneme_to_words_lm.sweep_contract import file_identity, positive_integer
+from phoneme_to_words_lm.llm_scoring import (
+    DEFAULT_PREFIX, SCORER_VERSION, prepare_scoring_inputs, training_example,
+    ScoringDataCollator, sentence_perplexity, score_sentences,
+)
 
 
 def load_sentences(file_path: str) -> List[str]:
@@ -55,164 +59,184 @@ def prepare_dataset(
     val_fraction: float = 0.05,
     seed: int = 42,
 ) -> Tuple[List[str], List[str], dict, dict]:
-    """Load, preprocess, deduplicate, upsample, and split sentences from multiple sources.
+    """Split global normalized identities before per-source training upsampling.
 
     Args:
         source_files: Mapping of source name -> file path (e.g. {"personal": "path.txt"}).
         upsample_factors: Mapping of source name -> integer upsample factor.
-        val_fraction: Fraction of each source to hold out for validation.
+        val_fraction: Fraction of global normalized sentence identities held out.
         seed: Random seed for reproducible splitting.
 
     Returns:
         (train_sentences, val_sentences, stats, val_by_source) where stats has
         per-source counts and val_by_source maps source name -> val sentence list.
     """
-    if not source_files:
-        raise ValueError("source_files must contain at least one source")
-
-    import random
+    if not isinstance(source_files, dict) or not source_files:
+        raise ValueError('source_files must contain at least one source')
+    if isinstance(val_fraction, bool) or not math.isfinite(val_fraction) or not 0 <= val_fraction < 1:
+        raise ValueError('val_fraction must be in [0,1)')
+    if not isinstance(upsample_factors, dict) or set(upsample_factors)-set(source_files):
+        raise ValueError('Upsampling factors must refer to known sources')
+    for name, value in upsample_factors.items():
+        positive_integer(f'upsample factor for {name}', value)
     rng = random.Random(seed)
-
-    all_train = []
-    all_val = []
-    val_by_source = {}
-    stats = {}
-
-    for source_name, file_path in source_files.items():
-        raw = load_sentences(file_path)
-        processed = preprocess_sentences(raw)
-
-        # Deduplicate (before upsampling)
-        unique = list(dict.fromkeys(processed))
-
-        # Stratified split
-        rng.shuffle(unique)
-        n_val = max(1, int(len(unique) * val_fraction))
-        val_part = unique[:n_val]
-        train_part = unique[n_val:]
-
-        # Upsample train split only
-        factor = upsample_factors.get(source_name, 1)
-        train_part = train_part * factor
-
-        all_train.extend(train_part)
-        all_val.extend(val_part)
-        val_by_source[source_name] = val_part
-
-        stats[source_name] = {
-            'raw': len(raw),
-            'unique': len(unique),
-            'train': len(train_part),
-            'val': len(val_part),
-            'upsample_factor': factor,
-        }
-
-    # Shuffle the combined train set
-    rng.shuffle(all_train)
-
-    return all_train, all_val, stats, val_by_source
+    sources, raw_counts = {}, {}
+    for name, path in source_files.items():
+        raw = load_sentences(str(Path(path).expanduser()))
+        sources[name] = sorted(set(preprocess_sentences(raw)))
+        raw_counts[name] = len(raw)
+    identities = sorted({text for values in sources.values() for text in values})
+    if not identities:
+        raise ValueError('No usable normalized training sentences')
+    if val_fraction and len(identities) < 2:
+        raise ValueError('Need at least two distinct sentences for train/validation; use val_fraction=0 for training only')
+    rng.shuffle(identities)
+    n_val = 0
+    if val_fraction:
+        n_val = min(len(identities) - 1, max(1, int(len(identities) * val_fraction)))
+    validation = set(identities[:n_val])
+    train, by_source, stats = [], {}, {}
+    for name in sorted(sources):
+        unique = sources[name]
+        val_part = [text for text in unique if text in validation]
+        train_part = [text for text in unique if text not in validation]
+        factor = upsample_factors.get(name, 1)
+        train.extend(train_part*factor)
+        by_source[name] = val_part
+        stats[name] = dict(raw=raw_counts[name], unique=len(unique),
+                           train=len(train_part)*factor, val=len(val_part), upsample_factor=factor)
+    rng.shuffle(train)
+    return train, sorted(validation), stats, by_source
 
 
 @torch.no_grad()
-def compute_perplexity(
-    model,
-    tokenizer,
-    sentences: List[str],
-    batch_size: int = 16,
-    max_length: int = 512,
-    device=None,
-    desc: str = "Computing Perplexity",
-) -> float:
-    """Compute perplexity of the model on a list of sentences."""
+def compute_perplexity(model, tokenizer, sentences, batch_size=16, max_length=512,
+                       device=None, desc="Computing Perplexity", *,
+                       prefix=DEFAULT_PREFIX, score_eos=False):
+    """Use the same exact target masks/counts as decoder sentence_v1 scoring.
+
+    device/desc remain accepted for caller compatibility. The model's device
+    determines inference placement; candidates are never silently truncated.
+    """
+    if device is not None and torch.device(device) != torch.device(model.device):
+        raise ValueError('device must match the loaded model device')
+    return sentence_perplexity(model, tokenizer, sentences, batch_size=batch_size,
+                               max_length=max_length, prefix=prefix, score_eos=score_eos)
+
+
+def validation_report(model, tokenizer, sentences, by_source=None, *, batch_size=16,
+                      max_length=512, prefix=DEFAULT_PREFIX, score_eos=False):
+    """Score each unique sentence once; aggregate exact counts overall/per source."""
+    unique = list(dict.fromkeys(sentences))
+    was_training = model.training
     model.eval()
-    if device is None:
-        device = next(model.parameters()).device
+    try:
+        raw, counts = score_sentences(model, tokenizer, unique, batch_size=batch_size,
+                                      max_length=max_length, prefix=prefix, score_eos=score_eos)
+    finally:
+        model.train(was_training)
+    indices = {text: i for i, text in enumerate(unique)}
 
-    total_loss = 0.0
-    total_tokens = 0
+    def aggregate(texts):
+        ids = [indices[text] for text in dict.fromkeys(texts)]
+        count = sum(counts[i] for i in ids)
+        nll = -math.fsum(raw[i] for i in ids)
+        try:
+            ppl = math.exp(nll/count) if count else None
+        except OverflowError:
+            ppl = None
+        return dict(nll=nll, target_tokens=count, perplexity=ppl)
+    return {
+        'overall': aggregate(unique),
+        'by_source': {
+            name: aggregate(values) for name, values in (by_source or {}).items()
+        },
+    }
 
-    for i in tqdm(range(0, len(sentences), batch_size), desc=desc):
-        batch = sentences[i:i + batch_size]
 
-        inputs = tokenizer(
-            batch,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-        ).to(device)
-
-        labels = inputs.input_ids.clone()
-        if tokenizer.pad_token_id is not None:
-            labels[labels == tokenizer.pad_token_id] = -100
-
-        outputs = model(**inputs, labels=labels, use_cache=False)
-
-        num_valid_tokens = (labels != -100).sum().item()
-        if num_valid_tokens > 0:
-            total_loss += outputs.loss.item() * num_valid_tokens
-            total_tokens += num_valid_tokens
-
-        del inputs, outputs, labels
-        torch.cuda.empty_cache()
-
-    if total_tokens == 0:
-        return float('inf')
-
-    return math.exp(total_loss / total_tokens)
+def save_adapter(model, tokenizer, directory, *, prefix, score_eos):
+    """Complete a save before publishing any of its files."""
+    directory = Path(directory)
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.adapter-', dir=directory.parent) as temporary:
+        model.save_pretrained(temporary)
+        tokenizer.save_pretrained(temporary)
+        files = list(Path(temporary).glob('adapter_model.*'))
+        if not Path(temporary, 'adapter_config.json').is_file() or not any(p.stat().st_size for p in files):
+            raise RuntimeError('Training did not produce a usable PEFT adapter')
+        Path(temporary, 'llm_scoring.json').write_text(json.dumps(
+            dict(version=SCORER_VERSION, prefix=prefix, score_eos=score_eos), indent=2))
+        directory.mkdir(parents=True, exist_ok=True)
+        for source in Path(temporary).iterdir():
+            if source.is_file():
+                source.replace(directory/source.name)
 
 
 class PerplexityCallback(TrainerCallback):
-    """Evaluate perplexity on validation set and save best model during training."""
-
-    def __init__(
-        self,
-        tokenizer,
-        val_sentences: List[str],
-        val_sentences_by_source: dict,
-        output_dir: str,
-        batch_size: int = 16,
-        max_length: int = 512,
-    ):
+    """Evaluate on optimizer-step boundaries without a duplicate Trainer pass."""
+    def __init__(self, tokenizer, val_sentences, val_sentences_by_source, output_dir,
+                 batch_size=16, max_length=512, prefix=DEFAULT_PREFIX, score_eos=False,
+                 eval_steps=1):
         self.tokenizer = tokenizer
-        self.val_sentences = val_sentences
-        self.val_sentences_by_source = val_sentences_by_source
+        self.sentences = val_sentences
+        self.by_source = val_sentences_by_source
         self.output_dir = output_dir
-        self.batch_size = batch_size
-        self.max_length = max_length
-        self.best_perplexity = float('inf')
+        self.options = dict(batch_size=batch_size, max_length=max_length, prefix=prefix, score_eos=score_eos)
+        self.eval_steps = eval_steps
+        self.best_perplexity = math.inf
+        self.best_report = None
+        self.last_report = None
+        self.last_step = None
+
+    def on_step_end(self, args, state, control, model, **kwargs):
+        if self.sentences and state.global_step % self.eval_steps == 0:
+            self.on_evaluate(args, state, control, model, **kwargs)
 
     def on_evaluate(self, args, state, control, model, **kwargs):
-        if not self.val_sentences:
+        self.evaluate(model, state.global_step)
+
+    def evaluate(self, model, step):
+        if not self.sentences:
             return
+        if self.last_step == step:
+            return self.last_report
+        report = validation_report(model, self.tokenizer, self.sentences, self.by_source, **self.options)
+        self.last_report, self.last_step = report, step
+        ppl = report['overall']['perplexity']
+        print(f"[Step {step}] Validation: {report}", flush=True)
+        if ppl is not None and math.isfinite(ppl) and ppl < self.best_perplexity:
+            save_adapter(model, self.tokenizer, self.output_dir,
+                         prefix=self.options['prefix'], score_eos=self.options['score_eos'])
+            self.best_perplexity, self.best_report = ppl, report
+        return report
 
-        # Overall perplexity
-        ppl = compute_perplexity(
-            model, self.tokenizer, self.val_sentences,
-            batch_size=self.batch_size,
-            max_length=self.max_length,
-            desc=f"Val PPL (step {state.global_step})",
-        )
-        print(f"\n[Step {state.global_step}] Perplexity: {ppl:.2f} (best: {self.best_perplexity:.2f})")
 
-        # Per-source breakdown
-        for source_name, source_sentences in self.val_sentences_by_source.items():
-            if source_sentences:
-                src_ppl = compute_perplexity(
-                    model, self.tokenizer, source_sentences,
-                    batch_size=self.batch_size,
-                    max_length=self.max_length,
-                    desc=f"  {source_name} PPL",
-                )
-                print(f"  {source_name}: {src_ppl:.2f}")
+def optimizer_schedule(n_examples, batch_size, accumulation, epochs, eval_every, max_steps=-1):
+    for name, value in (('examples', n_examples), ('batch_size', batch_size), ('accumulation', accumulation)):
+        positive_integer(name, value)
+    for name, value in (('epochs', epochs), ('eval_every', eval_every)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f'{name} must be finite and positive')
+    steps = math.ceil(math.ceil(n_examples/batch_size)/accumulation)
+    return dict(steps_per_epoch=steps, total_steps=max_steps if max_steps > 0 else math.ceil(epochs*steps),
+                eval_steps=max(1, math.ceil(steps*eval_every)))
 
-        if ppl < self.best_perplexity:
-            self.best_perplexity = ppl
-            print(f"[Step {state.global_step}] New best! Saving to {self.output_dir}")
-            model.save_pretrained(self.output_dir)
-            self.tokenizer.save_pretrained(self.output_dir)
 
-        model.train()
+def verify_adapter_reload(model, tokenizer, directory, sentences, expected, options):
+    """Load serialized LoRA weights into the unchanged base; avoid a second 4B copy."""
+    name = 'verify_saved'
+    previous = model.active_adapter
+    model.load_adapter(str(directory), adapter_name=name, is_trainable=False)
+    try:
+        model.set_adapter(name)
+        actual = validation_report(model, tokenizer, sentences, **options)['overall']
+        if actual['target_tokens'] != expected['target_tokens'] or not math.isclose(
+            actual['nll'], expected['nll'], rel_tol=1e-5, abs_tol=.01):
+            raise RuntimeError(f'Reloaded adapter differs from saved checkpoint: {directory}')
+        return dict(target_tokens=actual['target_tokens'], nll_absolute_error=abs(actual['nll']-expected['nll']))
+    finally:
+        model.set_adapter(previous)
+        model.delete_adapter(name)
 
 
 def main():
@@ -228,6 +252,10 @@ def main():
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="HuggingFace cache directory (default: ~/brand/huggingface)")
     parser.add_argument("--max-seq-length", type=int, default=512)
+    parser.add_argument("--llm-prefix", default=DEFAULT_PREFIX,
+                        help="Textual sentence conditioning prefix; default is a newline")
+    parser.add_argument("--score-eos", action="store_true",
+                        help="Train/evaluate EOS as a target; pass llm_score_eos=True when decoding")
     parser.add_argument("--num-epochs", type=float, default=3)
     parser.add_argument("--eval-every", type=float, default=0.25,
                         help="Evaluate every N epochs")
@@ -242,180 +270,175 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None,
                         help="CUDA device(s), e.g. '0' or '0,1'")
+    parser.add_argument('--max-steps', type=int, default=-1, help='Optional optimizer-step limit')
+    parser.add_argument('--dtype', choices=['bfloat16', 'float16', 'float32'], default='bfloat16')
+    parser.add_argument('--eval-steps', type=int, default=None, help='Override epoch-based evaluation interval')
     args = parser.parse_args()
 
-    # Parse source files: "name:path" pairs
-    source_files = {}
-    for item in args.source_files:
-        name, path = item.split(":", 1)
-        source_files[name] = path
-
-    # Parse upsample factors: "name:factor" pairs
-    upsample_factors = {}
-    for item in args.upsample_factors:
-        name, factor = item.split(":", 1)
-        upsample_factors[name] = int(factor)
-
     if args.device is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.device
+        if ',' in args.device or int(os.environ.get('WORLD_SIZE', '1')) != 1:
+            raise ValueError('This training utility currently supports one process/device per run')
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.device
+    if int(os.environ.get('WORLD_SIZE', '1')) != 1:
+        raise ValueError('Use one process/device per run for validation/checkpoint selection')
+    from transformers import set_seed
+    set_seed(args.seed)
 
-    # ---- Data ----
-    print("Preparing dataset...")
-    train_sentences, val_sentences, stats, val_sentences_by_source = prepare_dataset(
-        source_files=source_files,
-        upsample_factors=upsample_factors,
-        val_fraction=args.val_fraction,
-        seed=args.seed,
-    )
-    print(f"Train: {len(train_sentences)}, Val: {len(val_sentences)}")
-    for source_name, s in stats.items():
-        print(f"  {source_name}: {s['raw']} raw -> {s['unique']} unique -> "
-              f"{s['train']} train (x{s['upsample_factor']}) + {s['val']} val")
+    # Parse and validate data/training settings before loading the model.
+    def parse_pairs(items, conversion=str):
+        result = {}
+        for item in items:
+            name, value = item.split(':', 1)
+            if not name or name in result:
+                raise ValueError(f'Duplicate or empty source name: {name!r}')
+            result[name] = conversion(value)
+        return result
 
-    # ---- Model & Tokenizer ----
-    print(f"Loading model: {args.model_name}")
+    source_files = parse_pairs(args.source_files)
+    upsample_factors = parse_pairs(args.upsample_factors, int)
+    train_sentences, val_sentences, stats, by_source = prepare_dataset(
+        source_files, upsample_factors, val_fraction=args.val_fraction, seed=args.seed)
+    schedule = optimizer_schedule(len(train_sentences), args.batch_size,
+        args.gradient_accumulation_steps, args.num_epochs, args.eval_every, args.max_steps)
+    for name in ('max_seq_length', 'lora_rank', 'lora_alpha'):
+        positive_integer(name, getattr(args, name))
+    if args.max_steps != -1:
+        positive_integer('max_steps', args.max_steps)
+    if args.eval_steps is not None:
+        positive_integer('eval_steps', args.eval_steps)
+        schedule['eval_steps'] = args.eval_steps
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError('learning_rate must be finite and positive')
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0 or not 0 <= args.warmup_fraction <= 1:
+        raise ValueError('Invalid weight_decay or warmup_fraction')
+    output = Path(args.output_dir).expanduser().resolve()
+    if (output/'adapter_config.json').exists() or (output/'finetuning_results.json').exists():
+        raise ValueError('Use a new output directory for each training run')
+    try:
+        from datasets import Dataset
+        from peft import LoraConfig, TaskType
+        from trl import SFTTrainer, SFTConfig
+    except ImportError as exc:
+        raise ImportError('Finetuning requires datasets, peft and trl; see the tested training environment in the results report') from exc
     cache_dir = os.path.expanduser(args.cache_dir or HF_CACHE_DIR)
-
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=cache_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    tokenizer.padding_side = 'right'
+    # Prepare/validate every target before allocating model weights.
+    def make_dataset(sentences):
+        requests = prepare_scoring_inputs(tokenizer, sentences, prefix=args.llm_prefix,
+                                          score_eos=args.score_eos, max_length=args.max_seq_length)
+        return Dataset.from_list([training_example(r) for r in requests])
 
+    train_ds = make_dataset(train_sentences).shuffle(seed=args.seed)
+    if val_sentences:
+        make_dataset(val_sentences)
+    use_cuda = torch.cuda.is_available()
+    if not use_cuda and args.dtype != 'float32':
+        raise ValueError('CPU training requires --dtype float32')
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         cache_dir=cache_dir,
-        dtype=torch.bfloat16,
-        device_map="auto",
+        dtype=getattr(torch, args.dtype),
+        attn_implementation='sdpa',
+        device_map={'': 'cuda:0' if use_cuda else 'cpu'},
     )
     model.config.use_cache = False
-
-    # ---- Baseline Perplexity ----
-    if val_sentences:
-        print("Computing baseline perplexity...")
-        ppl_before = compute_perplexity(
-            model, tokenizer, val_sentences,
-            max_length=args.max_seq_length,
-            desc="Baseline PPL",
-        )
-        print(f"Baseline perplexity: {ppl_before:.2f}")
-    else:
-        ppl_before = None
-
-    # ---- LoRA ----
+    options = dict(batch_size=args.batch_size, max_length=args.max_seq_length,
+                   prefix=args.llm_prefix, score_eos=args.score_eos)
+    baseline = validation_report(model, tokenizer, val_sentences, by_source, **options) if val_sentences else None
+    targets = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+    matched = [name for name, _ in model.named_modules() if name.rsplit('.', 1)[-1] in targets]
+    if not matched:
+        raise ValueError('No configured LoRA target modules found in this model')
     peft_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
-        lora_dropout=0.0,
-        bias="none",
+        lora_dropout=0.,
+        bias='none',
         task_type=TaskType.CAUSAL_LM,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                         "gate_proj", "up_proj", "down_proj"],
+        target_modules=targets,
     )
+    output.mkdir(parents=True, exist_ok=True)
+    def identity(text):
+        return hashlib.sha256(text.encode()).hexdigest()
 
-    # ---- Dataset ----
-    def formatting_func(example):
-        return {"text": example["text"] + tokenizer.eos_token}
-
-    train_ds = Dataset.from_dict({"text": train_sentences})
-    train_ds = train_ds.map(formatting_func)
-    train_ds = train_ds.shuffle(seed=args.seed)
-
-    val_ds = None
-    if val_sentences:
-        val_ds = Dataset.from_dict({"text": val_sentences})
-        val_ds = val_ds.map(formatting_func)
-
-    # ---- Training Config ----
-    steps_per_epoch = len(train_ds) // (args.batch_size * args.gradient_accumulation_steps)
-    eval_steps = max(1, int(steps_per_epoch * args.eval_every))
-    total_steps = int(steps_per_epoch * args.num_epochs)
-    warmup_steps = int(total_steps * args.warmup_fraction)
-
-    print(f"Steps/epoch: {steps_per_epoch}, Eval every {eval_steps} steps, "
-          f"Total: {total_steps}, Warmup: {warmup_steps}")
-
-    output_dir = os.path.expanduser(args.output_dir)
+    split = dict(train_unique=sorted(identity(t) for t in set(train_sentences)),
+                 validation=sorted(identity(t) for t in val_sentences),
+                 validation_by_source={name: [identity(t) for t in values] for name, values in by_source.items()})
+    (output/'split_manifest.json').write_text(json.dumps(split, indent=2))
+    callback = PerplexityCallback(tokenizer, val_sentences, by_source, str(output/'best'),
+                                  eval_steps=schedule['eval_steps'], **options)
+    # The callback handles validation and best-checkpoint selection in one pass.
     training_args = SFTConfig(
-        output_dir=output_dir,
+        output_dir=str(output/'trainer'),
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_epochs,
+        max_steps=args.max_steps,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        warmup_steps=warmup_steps,
-        lr_scheduler_type="cosine",
-        optim="adamw_torch",
-        logging_steps=10,
-        bf16=True,
-        save_strategy="no",
-        eval_strategy="steps",
-        eval_steps=eval_steps,
-        report_to="none",
+        warmup_steps=int(schedule['total_steps']*args.warmup_fraction),
+        lr_scheduler_type='cosine',
+        optim='adamw_torch',
+        logging_steps=1,
+        bf16=args.dtype == 'bfloat16',
+        fp16=args.dtype == 'float16',
+        use_cpu=not use_cuda,
+        save_strategy='no',
+        eval_strategy='no',
+        report_to='none',
         seed=args.seed,
-        dataset_text_field="text",
+        dataset_kwargs={'skip_prepare_dataset': True},
         max_length=args.max_seq_length,
         packing=False,
+        gradient_checkpointing=True,
+        remove_unused_columns=False,
     )
-
-    ppl_callback = PerplexityCallback(
-        tokenizer=tokenizer,
-        val_sentences=val_sentences,
-        val_sentences_by_source=val_sentences_by_source,
-        output_dir=output_dir,
-        max_length=args.max_seq_length,
-    )
-
-    # ---- Train ----
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
+        data_collator=ScoringDataCollator(tokenizer.pad_token_id),
         train_dataset=train_ds,
-        eval_dataset=val_ds,
         peft_config=peft_config,
         args=training_args,
-        callbacks=[ppl_callback],
+        callbacks=[callback],
     )
-
-    print("Starting training...")
-    trainer.train()
-
-    # ---- Final Summary ----
-    ppl_after = None
-    if val_sentences:
-        trainer.model.eval()
-        ppl_after = compute_perplexity(
-            trainer.model, tokenizer, val_sentences,
-            max_length=args.max_seq_length,
-            desc="Final PPL",
-        )
-        print(f"\nPerplexity: {ppl_before:.2f} -> {ppl_after:.2f}")
-        print(f"Best during training: {ppl_callback.best_perplexity:.2f}")
-
-    print(f"Best model saved to {output_dir}")
-
-    # ---- Log Results ----
-    results_file = Path(output_dir) / "finetuning_results.json"
-    result_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "model_name": args.model_name,
-        "output_dir": output_dir,
-        "source_files": source_files,
-        "upsample_factors": upsample_factors,
-        "num_epochs": args.num_epochs,
-        "learning_rate": args.learning_rate,
-        "lora_rank": args.lora_rank,
-        "lora_alpha": args.lora_alpha,
-        "batch_size": args.batch_size,
-        "seed": args.seed,
-        "data_stats": stats,
-        "baseline_ppl": round(ppl_before, 2) if ppl_before else None,
-        "final_ppl": round(ppl_after, 2) if ppl_after else None,
-        "best_ppl": round(ppl_callback.best_perplexity, 2) if ppl_callback.best_perplexity < float('inf') else None,
-    }
-    with open(results_file, "w") as f:
-        json.dump(result_entry, f, indent=2)
-    print(f"Results logged to {results_file}")
+    train_output = trainer.train()
+    save_adapter(trainer.model, tokenizer, output/'final', prefix=args.llm_prefix, score_eos=args.score_eos)
+    final = callback.evaluate(trainer.model, trainer.state.global_step)
+    # No evaluation or no finite best still produces a usable selected adapter.
+    selected = 'best' if callback.best_report is not None else 'final'
+    checks = {}
+    check_sentences = val_sentences or list(dict.fromkeys(train_sentences))[:4]
+    if final is not None:
+        expected_final = final['overall']
+    else:
+        expected_final = validation_report(
+            trainer.model, tokenizer, check_sentences, **options)['overall']
+    checks['final'] = verify_adapter_reload(trainer.model, tokenizer, output/'final', check_sentences, expected_final, options)
+    if callback.best_report is not None:
+        checks['best'] = verify_adapter_reload(trainer.model, tokenizer, output/'best',
+                                               val_sentences, callback.best_report['overall'], options)
+    # Keep the existing decoder-facing output-dir API: root contains the selected adapter.
+    for source in (output/selected).iterdir():
+        if source.is_file():
+            shutil.copy2(source, output/source.name)
+    import importlib.metadata
+    results = dict(timestamp=datetime.now().isoformat(), model_name=args.model_name,
+        text_normalization=TEXT_NORMALIZATION_VERSION,
+        training_config=vars(args), source_identities={name: file_identity(Path(path).expanduser()) for name, path in source_files.items()},
+        source_files=source_files, upsample_factors=upsample_factors, stats=stats,
+        train_examples=len(train_sentences), validation_unique=len(val_sentences), schedule=schedule,
+        actual_optimizer_steps=trainer.state.global_step, selected_adapter=selected,
+        baseline_validation=baseline, final_validation=final, best_validation=callback.best_report,
+        adapter_reload_checks=checks, lora_target_modules=matched, training_metrics=train_output.metrics,
+        versions={name: importlib.metadata.version(name) for name in ('torch','transformers','peft','trl','datasets')})
+    (output/'finetuning_results.json').write_text(json.dumps(results, indent=2, allow_nan=False))
+    print(f'Saved final adapter and selected {selected} adapter in {output}', flush=True)
+    print(json.dumps(results, indent=2), flush=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

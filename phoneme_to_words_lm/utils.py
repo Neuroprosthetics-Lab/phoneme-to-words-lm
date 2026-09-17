@@ -1,7 +1,7 @@
-import numpy as np
 import re
 import os
 import pickle
+import unicodedata
 from pathlib import Path
 
 
@@ -46,10 +46,21 @@ LOGIT_PHONE_DEF = [
     'W', 'Y', 'Z', 'ZH'
 ]
 
-# Load cmu_dict from package data
+# Load the pronunciation dictionary only for callers that need it.
 _CMU_DICT_PATH = Path(__file__).parent / 'cmu_dict.pkl'
-with open(_CMU_DICT_PATH, 'rb') as f:
-    cmu_dict = pickle.load(f)
+
+
+def get_cmu_dict():
+    if 'cmu_dict' not in globals():
+        with open(_CMU_DICT_PATH, 'rb') as f:
+            globals()['cmu_dict'] = pickle.load(f)
+    return globals()['cmu_dict']
+
+
+def __getattr__(name):
+    if name == 'cmu_dict':
+        return get_cmu_dict()
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 
 # Convert text to phonemes
@@ -57,7 +68,6 @@ def phonemize_sentence(
         thisTranscription,
         phone_def = PHONE_DEF_SIL,
         sil_def = SIL_DEF,
-        diphone_def = None,
         maxSeqLen = 500,
         g2p = None,
         correct_phonemes = True,
@@ -66,8 +76,11 @@ def phonemize_sentence(
         verbosity = True
         ):
 
-    from g2p_en import G2p
+    import numpy as np
+    cmu_dict = get_cmu_dict() if correct_phonemes else {}
+
     if g2p is None:
+        from g2p_en import G2p
         g2p = G2p()
 
     # Initialize variables
@@ -90,10 +103,6 @@ def phonemize_sentence(
     if len(thisTranscription) == 0:
         phonemes = sil_def
     else:
-        if diphone_def is not None:
-            #add one SIL symbol at the beginning so there's one at the beginning of each word
-            phonemes.append('SIL')
-
         for p in g2p(thisTranscription):
             if p==' ':
                 phonemes.append('SIL')
@@ -108,9 +117,9 @@ def phonemize_sentence(
         # replace phoneme sequences for words where g2p_en differs from cmudict
         if correct_phonemes:
             phonemes_by_word = [p.strip() for p in ' '.join(phonemes[:-1]).split('SIL')]
-            for w, p in zip(thisTranscription.split(), phonemes_by_word):
+            for word_index, (w, p) in enumerate(zip(thisTranscription.split(), phonemes_by_word)):
                 if w in cmu_dict and p.split() not in cmu_dict[w]:
-                    phonemes_by_word[phonemes_by_word.index(p)] = ' '.join(cmu_dict[w][0])
+                    phonemes_by_word[word_index] = ' '.join(cmu_dict[w][0])
                     if verbosity:
                         print(f'Corrected phonemization of "{w}" from "{p}" to "{" ".join(cmu_dict[w][0])}"')
 
@@ -120,19 +129,11 @@ def phonemize_sentence(
                 phonemes += p.split(' ')
                 phonemes.append('SIL')
 
-        # convert to diphones
-        if diphone_def is not None:
-            diphones = []
-            for i in range(len(phonemes)-1):
-                diphones.append(phonemes[i] + '->' + phonemes[i])
-                diphones.append(phonemes[i] + '->' + phonemes[i+1])
-            phonemes = diphones
-
     # remove any empty phonemes
     phonemes = [p for p in phonemes if p != '']
 
-    # remove duplicate phonemes
-    phonemes = [phonemes[i] for i in range(len(phonemes)) if i == 0 or phonemes[i] != phonemes[i-1]]
+    # These are linguistic targets, not CTC frame predictions: adjacent
+    # repeated phones must survive (e.g. adventurer ends with ER ER).
 
     # return
     if not return_seq:
@@ -141,25 +142,79 @@ def phonemize_sentence(
     else:
         # Segment phonemes
         seqLen = len(phonemes)
-        if diphone_def is not None:
-            seqClassIDs[0:seqLen] = [diphone_def.index(p) + 1 for p in phonemes]
-        else:
-            seqClassIDs[0:seqLen] = [phone_def.index(p) + 1 for p in phonemes]
+        if seqLen > maxSeqLen:
+            raise ValueError(f'Phoneme sequence length {seqLen} exceeds maxSeqLen={maxSeqLen}')
+        seqClassIDs[0:seqLen] = [phone_def.index(p) + 1 for p in phonemes]
 
         return phonemes, seqClassIDs, seqLen
 
 
+TEXT_NORMALIZATION_VERSION = 'english_v3'
+
+
+# Mapping of Unicode punctuation to ASCII equivalents.
+_UNICODE_PUNCT_MAP = str.maketrans({
+    # Smart/curly quotes -> straight
+    '\u2018': "'",   # left single
+    '\u2019': "'",   # right single
+    '\u201A': "'",   # single low-9
+    '\u201B': "'",   # single high-reversed-9
+    '\u201C': '"',   # left double
+    '\u201D': '"',   # right double
+    '\u201E': '"',   # double low-9
+    '\u201F': '"',   # double high-reversed-9
+    '\u2039': "'",   # single left-pointing angle
+    '\u203A': "'",   # single right-pointing angle
+    '\u00AB': '"',   # left-pointing double angle (guillemet)
+    '\u00BB': '"',   # right-pointing double angle (guillemet)
+
+    # Dashes -> space (word boundaries)
+    '\u2013': ' ',   # en dash
+    '\u2014': ' ',   # em dash
+    '\u2015': ' ',   # horizontal bar
+
+    # Ellipsis -> period (for sentence splitting)
+    '\u2026': '.',
+
+    # Other common Unicode punctuation
+    '\u2032': "'",   # prime
+    '\u2033': '"',   # double prime
+    '\u00B7': ' ',   # middle dot
+    '\u2022': ' ',   # bullet
+    '\u2010': '-',   # hyphen
+    '\u2011': '-',   # non-breaking hyphen
+    '\u2012': '-',   # figure dash
+})
+
+
+def normalize_unicode_punctuation(text: str) -> str:
+    """Replace Unicode punctuation with ASCII equivalents."""
+    return text.translate(_UNICODE_PUNCT_MAP)
+
+
+
+def normalize_unicode(text: str) -> str:
+    """Strip decomposable Latin accents; this English pipeline retains ASCII."""
+    return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+
+
 def remove_punctuation(sentence):
-    # Remove punctuation
-    sentence = re.sub(r'[^a-zA-Z\- \']', '', sentence)
-    sentence = sentence.replace('- ', ' ').lower()
-    sentence = sentence.replace('--', '').lower()
-    sentence = sentence.replace(" '", "'").lower()
-
-    sentence = sentence.strip()
-    sentence = ' '.join([word for word in sentence.split() if word != ''])
-
-    return sentence
+    # Preserve Unicode apostrophes, accents and word boundaries before filtering.
+    sentence = normalize_unicode(normalize_unicode_punctuation(sentence)).lower()
+    sentence = re.sub(r"[^a-z\-']", ' ', sentence)
+    if "'" in sentence:
+        # Remove paired quotation marks, retaining apostrophes inside the quote.
+        sentence = re.sub(r"(?<![a-z])'(\S+)'(?![a-z])", r'\1', sentence)
+        # Join only contraction suffixes, never arbitrary words such as 'cause.
+        sentence = re.sub(r"(?<=[a-z])\s+'\s*(s|t|m|d|ll|re|ve)\b(?!\s*')", r"'\1", sentence)
+        # A leading elision is not an opening quote: "give 'em the masters' work".
+        sentence = re.sub(
+            r"(?<![a-z])'(?!(?:bout|cause|em|n|round|til|tis|twas|twere|twill|twould)\b)(.*?)'(?![a-z])",
+            r'\1', sentence)
+        sentence = re.sub(r"(?<![a-z])'+(?![a-z])", ' ', sentence)
+    # Keep word-internal hyphens; dashes and detached hyphens are separators.
+    sentence = re.sub(r'-{2,}|(?<![a-z])-|-(?![a-z])', ' ', sentence)
+    return ' '.join(sentence.split())
 
 
 _WORD_REPLACEMENTS = {
@@ -285,11 +340,9 @@ _WORD_REPLACEMENTS = {
 
     # contractions
     # NOTE: "were"/"we're", "well"/"we'll", and "ill"/"i'll" are omitted
-    # because they are ambiguous with real words.
-    "lets": "let's",
+    # because they are ambiguous with real words. Also preserve lets, cant,
+    # wont, masters and masters': they are not missing-apostrophe typos.
     'dont': "don't",
-    'cant': "can't",
-    'wont': "won't",
     'doesnt': "doesn't",
     'didnt': "didn't",
     'isnt': "isn't",
@@ -318,8 +371,6 @@ _WORD_REPLACEMENTS = {
     'youll': "you'll",
     'theyll': "they'll",
     'im': "i'm",
-    "masters": "master's",
-    "masters'": "master's",
 
     # abbreviations
     'mr': 'mister',

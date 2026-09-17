@@ -4,9 +4,9 @@
 # automatically from the parameter space (product of all value counts).
 #
 # Usage:
-#   python hyperparameter_sweep/lm_sweep.py --sweep_config example_lm_sweep_grid.yaml --devices cuda:0
+#   python sweep/lm_sweep.py --sweep_config example_lm_sweep_grid.yaml --devices cuda:0
 #
-# This example has 3 * 3 * 3 * 3 * 3 * 1 = 243 combinations.
+# This example has 3 * 3 * 3 * 2 * 5 = 270 combinations.
 
 study_name: "lm_decoder_grid"
 
@@ -37,6 +37,10 @@ alpha_range:
 # Eval settings
 # ---------------------------------------------------------------------------
 eval_every_nth: 1
+max_sentences: null
+timing_warmup_sentences: 1  # excluded from timing only; all sentences count for WER
+worker_timeout_seconds: null
+seed: 42
 reorder_logit_columns: true
 
 # ---------------------------------------------------------------------------
@@ -50,10 +54,10 @@ output_dir: /path/to/lm_grid_output                # <-- UPDATE THIS
 # ---------------------------------------------------------------------------
 # Objective weights (optional)
 # ---------------------------------------------------------------------------
-# Weight WER vs decode time when ranking results. Both objectives are
-# min-max normalized to [0, 1], then combined:
-#   score = wer_weight * norm_wer + time_weight * norm_time
-# Higher weight = more important. Default is equal (1.0, 1.0).
+# Raw units: WER fraction (0.01 = 1%) and mean seconds per sentence.
+#   score = wer_weight * wer + time_weight * avg_decode_time
+# No min-max normalization. Benchmark latency finalists in isolation.
+# Default weights are (1.0, 1.0).
 objective_weights:
   wer: 2.0
   time: 1.0
@@ -79,9 +83,10 @@ parameters:
     high: 50.0
     n_grid_points: 3          # -> [20.0, 35.0, 50.0]
 
+  # Keep the first frame per high-blank run; 1.0 is the full-CTC reference.
   blank_skip_threshold:
     type: choice
-    values: [0.95, 0.999, 1.0]
+    values: [0.98, 1.0]
 
   lm_weight:
     type: float_range
