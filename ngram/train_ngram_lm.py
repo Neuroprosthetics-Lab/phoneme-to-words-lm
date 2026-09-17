@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import json
+import math
+from pathlib import Path
+import tempfile
 import os
 import pickle
 import re
@@ -21,11 +25,18 @@ import subprocess
 import sys
 import time
 
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from phoneme_to_words_lm.utils import LOGIT_PHONE_DEF
-from text_normalize import collect_vocab_from_normalized, normalize_corpus
+from phoneme_to_words_lm.utils import LOGIT_PHONE_DEF, TEXT_NORMALIZATION_VERSION
+try:
+    from .text_normalize import normalize_corpus
+except ImportError:  # Direct script execution.
+    from text_normalize import normalize_corpus
+from phoneme_to_words_lm.sweep_contract import file_identity
 
 # Default to the cmu_dict.pkl bundled with the phoneme_to_words_lm package
 # when the config doesn't specify cmu_dict_path.
@@ -310,7 +321,7 @@ def interpolate_lms_kenlm(
         )
 
     if returncode != 0:
-        log.error(f'KenLM interpolate failed (exit {returncode})')
+        log.error(f'KenLM interpolate failed (exit {returncode}): {stderr}')
         raise subprocess.CalledProcessError(returncode, cmd, stderr=stderr)
 
     arpa_size = os.path.getsize(output_arpa)
@@ -414,6 +425,7 @@ def generate_lexicon(
     lines = []
 
     if lm_type == 'spelling':
+        validate_spelling_vocabulary(vocab, 'lexicon vocabulary')
         for letter in sorted(SPOKEN_LETTER_PHONEMES):
             phonemes = ' '.join(SPOKEN_LETTER_PHONEMES[letter]) + ' SIL'
             lines.append(f'{letter}\t{phonemes}\n')
@@ -436,17 +448,18 @@ def generate_lexicon(
             disable=not sys.stderr.isatty(),
         )
         for word in pbar:
-            if word in cmu_dict:
-                for pronunciation in cmu_dict[word]:
+            lookup = word.casefold()
+            if lookup in cmu_dict:
+                for pronunciation in cmu_dict[lookup]:
                     phonemes = ' '.join(pronunciation) + ' SIL'
                     lines.append(f'{word}\t{phonemes}\n')
                 n_found += 1
-            elif english_words is None or word not in english_words:
+            elif english_words is None or lookup not in english_words:
                 reason = 'no_english_words_list' if english_words is None else 'not_in_english_words'
                 rejected_lines.append(f'{word}\t{reason}\n')
                 n_filtered += 1
             else:
-                g2p_phones = _g2p_phonemize(word)
+                g2p_phones = _g2p_phonemize(lookup)
                 if g2p_phones is not None:
                     phonemes = ' '.join(g2p_phones) + ' SIL'
                     lines.append(f'{word}\t{phonemes}\n')
@@ -481,6 +494,14 @@ def generate_lexicon(
         if rejected_lines:
             log.info(f'  Rejected words written to {rejected_path}')
 
+    lines = list(dict.fromkeys(lines))
+    if not lines:
+        raise ValueError('No usable lexicon entries; check the model vocabulary and pronunciation dictionary')
+    allowed_phones = set(LOGIT_PHONE_DEF) - {'BLANK'}
+    for line in lines:
+        phones = line.split()[1:]
+        if not phones or phones[-1] != 'SIL' or any(p not in allowed_phones for p in phones):
+            raise ValueError(f'Invalid lexicon pronunciation: {line.strip()}')
     with open(output_path, 'w') as f:
         f.writelines(lines)
 
@@ -618,7 +639,7 @@ def load_and_validate_config(config_path: str) -> OmegaConf:
         # Users with headroom can override explicitly.
         resolved = min(os.cpu_count() or 1, 16)
         OmegaConf.update(cfg, 'normalize_workers', resolved)
-    elif not isinstance(nw, int) or nw < 1:
+    elif isinstance(nw, bool) or not isinstance(nw, int) or nw < 1:
         raise ValueError(
             f'normalize_workers must be a positive int (or unset for auto), got {nw!r}'
         )
@@ -669,7 +690,11 @@ def load_and_validate_config(config_path: str) -> OmegaConf:
             )
 
         # Reuse fields are backend-specific.
-        if has_arpa and backend == 'kenlm':
+        if has_arpa and has_inter:
+            raise ValueError(f'Corpus [{i}] cannot supply both arpa_path and intermediate_path')
+        if has_inter and len(cfg.corpora) == 1:
+            raise ValueError('Single prebuilt intermediate input is unsupported: supply an ARPA, or remove intermediate_path and train from raw/normalized text')
+        if has_arpa and backend == 'kenlm' and len(cfg.corpora) > 1:
             raise ValueError(
                 f"Corpus [{i}] specifies arpa_path but interpolator_backend "
                 f"is 'kenlm'. KenLM interpolate cannot consume ARPA files. "
@@ -720,7 +745,7 @@ def load_and_validate_config(config_path: str) -> OmegaConf:
         # Order is required.
         if 'order' not in c:
             raise ValueError(f'Corpus [{i}] must have an order field')
-        if not isinstance(c.order, int) or not 1 <= c.order <= 10:
+        if isinstance(c.order, bool) or not isinstance(c.order, int) or not 1 <= c.order <= 10:
             raise ValueError(f'Corpus [{i}] order must be an int 1-10, got {c.order}')
 
         # Pruning validation.
@@ -729,8 +754,37 @@ def load_and_validate_config(config_path: str) -> OmegaConf:
             pruning = list(pruning)
             if len(pruning) != c.order:
                 raise ValueError(f'Corpus [{i}] pruning length ({len(pruning)}) must match order ({c.order})')
+            if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in pruning) or pruning != sorted(pruning):
+                raise ValueError(f'Corpus [{i}] pruning must be nonnegative, nondecreasing integer thresholds')
             if pruning[0] != 0:
                 raise ValueError(f'Corpus [{i}] pruning[0] must be 0 (unigrams cannot be pruned)')
+
+        if has_arpa:
+            vocab = arpa_vocabulary(c.arpa_path, expected_order=c.order)
+            if cfg.lm_type == 'spelling':
+                validate_spelling_vocabulary(vocab, c.arpa_path)
+        if has_inter:
+            metadata = Path(f'{c.intermediate_path}.kenlm_intermediate').read_text().splitlines()
+            count_lines = [line.split()[1:] for line in metadata if line.startswith('Counts ')]
+            if len(count_lines) != 1 or len(count_lines[0]) != c.order or any(not v.isdigit() for v in count_lines[0]):
+                raise ValueError(f'Configured order differs from intermediate Counts metadata: {c.intermediate_path}')
+            for suffix in ['vocab', 'kenlm_intermediate'] + list(map(str, range(1, c.order+1))):
+                part = Path(f'{c.intermediate_path}.{suffix}')
+                if not part.is_file() or part.stat().st_size == 0:
+                    raise ValueError(f'Missing or empty intermediate artifact: {part}')
+            if cfg.lm_type == 'spelling':
+                # KenLM's vocabulary sidecar contains NUL-terminated UTF-8 words.
+                vocab_path = Path(f'{c.intermediate_path}.vocab')
+                vocab = set(vocab_path.read_text().split('\0')) - {'', '<s>', '</s>', '<unk>'}
+                validate_spelling_vocabulary(vocab, vocab_path)
+        weight = OmegaConf.select(c, 'weight')
+        if weight is not None and (isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0):
+            raise ValueError(f'Corpus [{i}] weight must be finite and positive')
+        if 'discount_fallback' in c and not isinstance(c.discount_fallback, bool):
+            raise ValueError(f'Corpus [{i}] discount_fallback must be boolean')
+
+    if backend == 'kenlm' and len({c.order for c in cfg.corpora}) > 1:
+        raise ValueError('KenLM interpolation requires equal corpus orders in this pipeline; use SRILM ARPAs for mixed orders, or retrain at a common order')
 
     # --- Resolve corpus names (explicit or derived from source filenames) ---
     _resolve_corpus_names(cfg.corpora)
@@ -747,7 +801,7 @@ def load_and_validate_config(config_path: str) -> OmegaConf:
     def _check_tool(path: str, name: str, required: bool = True):
         if not required:
             return
-        resolved = shutil.which(path) or (os.path.exists(path) and path)
+        resolved = shutil.which(path)
         if not resolved:
             raise FileNotFoundError(
                 f'{name} not found at "{path}". '
@@ -756,7 +810,7 @@ def load_and_validate_config(config_path: str) -> OmegaConf:
 
     # lmplz is needed whenever any corpus lacks a backend-appropriate
     # pre-built artifact (arpa for srilm, intermediate for kenlm).
-    prebuilt_key = 'arpa_path' if backend == 'srilm' else 'intermediate_path'
+    prebuilt_key = 'arpa_path' if backend == 'srilm' or len(cfg.corpora) == 1 else 'intermediate_path'
     needs_lmplz = any(OmegaConf.select(c, prebuilt_key) is None for c in cfg.corpora)
     _check_tool(cfg.lmplz_path, 'lmplz', required=needs_lmplz)
     _check_tool(cfg.build_binary_path, 'build_binary')
@@ -781,7 +835,7 @@ def load_and_validate_config(config_path: str) -> OmegaConf:
     # --- Create output directories ---
     os.makedirs(cfg.output_dir, exist_ok=True)
     os.makedirs(os.path.join(cfg.output_dir, 'normalized'), exist_ok=True)
-    if backend == 'srilm':
+    if backend == 'srilm' or len(cfg.corpora) == 1:
         os.makedirs(os.path.join(cfg.output_dir, 'arpa'), exist_ok=True)
     else:
         os.makedirs(os.path.join(cfg.output_dir, 'intermediate'), exist_ok=True)
@@ -793,10 +847,100 @@ def load_and_validate_config(config_path: str) -> OmegaConf:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def arpa_vocabulary(path, expected_order=None):
+    """Read actual word identities from unigrams, retaining original case."""
+    vocab, order, in_unigrams = set(), 0, False
+    with open(path, encoding='utf-8') as stream:
+        for line in stream:
+            line = line.strip()
+            match = re.fullmatch(r'ngram\s+(\d+)\s*=\s*\d+', line)
+            if match:
+                order = max(order, int(match[1]))
+            if line == '\\1-grams:':
+                in_unigrams = True
+                continue
+            if in_unigrams and line.startswith('\\'):
+                break
+            if in_unigrams and line:
+                fields = line.split()
+                if len(fields) not in (2, 3):
+                    raise ValueError(f'Invalid ARPA unigram: {line}')
+                float(fields[0])  # Reject malformed probability fields early.
+                if fields[1] not in ('<s>', '</s>', '<unk>'):
+                    vocab.add(fields[1])
+    if not order or not in_unigrams or not vocab:
+        raise ValueError(f'ARPA has no usable unigram vocabulary: {path}')
+    if expected_order is not None and expected_order != order:
+        raise ValueError(f'Configured order {expected_order} differs from ARPA order {order}: {path}')
+    return vocab
+
+
+def train_ngram_lm(cfg):
+    """Build in a temporary directory; publish verified artifacts on success.
+
+    Files are individually replaced, with the completion manifest published
+    last. Consumers should verify its hashes before using a reused output set.
+    Failed training leaves a previous successful set untouched.
+    """
+    destination = Path(cfg.output_dir).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    effective = OmegaConf.to_container(cfg, resolve=True)
+    inputs = set()
+    for corpus in effective['corpora']:
+        if corpus.get('arpa_path'):
+            inputs.add(corpus['arpa_path'])
+        elif corpus.get('intermediate_path'):
+            prefix = corpus['intermediate_path']
+            inputs.update(f'{prefix}.{suffix}' for suffix in
+                          ['vocab', 'kenlm_intermediate']+list(map(str, range(1, corpus['order']+1))))
+        else:
+            inputs.update(_as_path_list(corpus.get('normalized_path') or corpus['path']))
+    for key in ('cmu_dict_path', 'english_words_path'):
+        if effective.get(key):
+            inputs.add(effective[key])
+    tools = [file_identity(shutil.which(effective[key])) for key in
+             ('lmplz_path', 'build_binary_path', 'srilm_ngram_path', 'kenlm_interpolate_path')
+             if shutil.which(effective[key])]
+    manifest = dict(config=effective, inputs=[file_identity(p) for p in sorted(inputs)], tools=tools,
+                    text_normalization=TEXT_NORMALIZATION_VERSION,
+                    interpolation=('none' if len(cfg.corpora) == 1 else
+                                   'linear' if cfg.interpolator_backend == 'srilm' else 'log_linear'),
+                    weight_policy='normalize_positive_weights_to_sum_one',
+                    pruning='per_corpus_count_thresholds; prebuilt pruning may be unknown')
+    with tempfile.TemporaryDirectory(prefix='.build-', dir=destination) as temporary:
+        staged = OmegaConf.create(effective)
+        staged.output_dir = temporary
+        for name in ('normalized', 'arpa', 'intermediate'):
+            Path(temporary, name).mkdir()
+        _train_ngram_lm(staged)
+        required = ('lm.arpa', 'lm_unpruned.bin', 'lexicon.txt', 'tokens.txt')
+        for name in required:
+            if not Path(temporary, name).is_file() or not Path(temporary, name).stat().st_size:
+                raise ValueError(f'Build produced an empty/missing {name}')
+        manifest['outputs'] = {name: {k: v for k, v in file_identity(Path(temporary, name)).items()
+                                      if k != 'path'} for name in required}
+        Path(temporary, 'build_manifest.json').write_text(json.dumps(manifest, indent=2))
+        # Once publication begins, an incomplete update must not look complete.
+        (destination/'build_manifest.json').unlink(missing_ok=True)
+        files = sorted(p for p in Path(temporary).rglob('*') if p.is_file() and p.name != 'build_manifest.json')
+        for source in files:
+            target = destination/source.relative_to(temporary)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(target)
+        Path(temporary, 'build_manifest.json').replace(destination/'build_manifest.json')
+
+
+def validate_spelling_vocabulary(tokens, source):
+    unsupported = set(tokens) - SPOKEN_LETTER_PHONEMES.keys()
+    if unsupported:
+        raise ValueError(f'{source}: spelling supports only a-z letter tokens; found {sorted(unsupported)!r}. '
+                         'Re-normalize the corpus and rebuild the spelling model.')
+
+
 def _concat_normalized(input_paths: list[str], output_path: str, lm_type: str) -> None:
     """Concatenate normalized text files into a single output file.
 
-    For ``word`` mode this is a byte-level concat. For ``spelling`` mode the
+    For ``word`` mode every nonempty file ends at a sentence boundary. For ``spelling`` mode the
     per-file outputs are deduplicated character-expanded words; we re-dedupe
     across files so a word appearing in multiple inputs still occupies one
     line in the merged output (matching ``normalize_corpus`` semantics).
@@ -805,10 +949,11 @@ def _concat_normalized(input_paths: list[str], output_path: str, lm_type: str) -
         seen: set[str] = set()
         for ip in input_paths:
             with open(ip, 'r') as f:
-                for line in f:
-                    entry = line.rstrip('\n')
-                    if entry:
-                        seen.add(entry)
+                for line_number, line in enumerate(f, 1):
+                    tokens = line.split()
+                    validate_spelling_vocabulary(tokens, f'{ip}:{line_number}')
+                    if tokens:
+                        seen.add(' '.join(tokens))
         with open(output_path, 'w') as f:
             for entry in sorted(seen):
                 f.write(entry + '\n')
@@ -817,20 +962,24 @@ def _concat_normalized(input_paths: list[str], output_path: str, lm_type: str) -
             for ip in input_paths:
                 with open(ip, 'rb') as fin:
                     shutil.copyfileobj(fin, fout)
+                    size = fin.tell()
+                    if size:
+                        fin.seek(-1, os.SEEK_END)
+                        if fin.read(1) != b'\n':
+                            fout.write(b'\n')
 
 
-def train_ngram_lm(cfg) -> None:
+def _train_ngram_lm(cfg) -> None:
     """Run the full n-gram LM training pipeline."""
     t_start = time.time()
 
     # ---- Step 1: Normalize corpora ----
     log.info('Step 1: Text normalization')
-    all_vocab: set[str] = set()
     normalized_paths: list[str] = []
 
     # Backend-dependent per-corpus "pre-built artifact" field: when set,
     # the corpus is already trained and step 2 skips lmplz for it.
-    prebuilt_key = 'arpa_path' if cfg.interpolator_backend == 'srilm' else 'intermediate_path'
+    prebuilt_key = 'arpa_path' if cfg.interpolator_backend == 'srilm' or len(cfg.corpora) == 1 else 'intermediate_path'
 
     for i, c in enumerate(cfg.corpora):
         norm_path = os.path.join(cfg.output_dir, 'normalized', f'{c.name}.txt')
@@ -838,20 +987,14 @@ def train_ngram_lm(cfg) -> None:
         if OmegaConf.select(c, prebuilt_key) is not None:
             kind = 'ARPA' if prebuilt_key == 'arpa_path' else 'intermediate'
             log.info(f'  Corpus [{i}] ({c.name}): using existing {kind}, skipping normalization')
-            # Still need to collect vocab for word-mode lexicon generation.
-            # Try normalized_path, then path, then skip vocab collection.
-            if cfg.lm_type == 'word':
-                src = OmegaConf.select(c, 'normalized_path') or OmegaConf.select(c, 'path')
-                if src:
-                    for sp in _as_path_list(src):
-                        log.info(f'  Corpus [{i}] ({c.name}): scanning {sp} for vocab')
-                        all_vocab |= collect_vocab_from_normalized(sp)
+            # Final ARPA unigrams provide the exact union after interpolation;
+            # auxiliary raw text is neither required nor scanned as normalized.
             normalized_paths.append(None)  # No normalized file for this corpus.
             continue
 
         if OmegaConf.select(c, 'normalized_path') is not None:
             norm_srcs = _as_path_list(c.normalized_path)
-            if len(norm_srcs) == 1:
+            if len(norm_srcs) == 1 and cfg.lm_type != 'spelling':
                 log.info(f'  Corpus [{i}] ({c.name}): using pre-normalized text from {norm_srcs[0]}')
                 shutil.copy2(norm_srcs[0], norm_path)
             else:
@@ -859,8 +1002,6 @@ def train_ngram_lm(cfg) -> None:
                 for ns in norm_srcs:
                     log.info(f'    - {ns}')
                 _concat_normalized(norm_srcs, norm_path, cfg.lm_type)
-            if cfg.lm_type == 'word':
-                all_vocab |= collect_vocab_from_normalized(norm_path)
             normalized_paths.append(norm_path)
             continue
 
@@ -868,9 +1009,8 @@ def train_ngram_lm(cfg) -> None:
         if len(src_paths) == 1:
             log.info(f'  Corpus [{i}] ({c.name}): normalizing {src_paths[0]} '
                      f'(workers={cfg.normalize_workers})')
-            vocab = normalize_corpus(src_paths[0], norm_path, cfg.lm_type,
-                                     workers=cfg.normalize_workers)
-            all_vocab |= vocab
+            normalize_corpus(src_paths[0], norm_path, cfg.lm_type,
+                             workers=cfg.normalize_workers)
         else:
             log.info(f'  Corpus [{i}] ({c.name}): normalizing and concatenating '
                      f'{len(src_paths)} files into {norm_path} '
@@ -882,9 +1022,8 @@ def train_ngram_lm(cfg) -> None:
             # for inspection; they're cleaned up only after a successful merge.
             part_paths = [f'{norm_path}.part{j}' for j in range(len(src_paths))]
             for sp, pp in zip(src_paths, part_paths):
-                vocab = normalize_corpus(sp, pp, cfg.lm_type,
-                                         workers=cfg.normalize_workers)
-                all_vocab |= vocab
+                normalize_corpus(sp, pp, cfg.lm_type,
+                                 workers=cfg.normalize_workers)
             _concat_normalized(part_paths, norm_path, cfg.lm_type)
             for pp in part_paths:
                 os.remove(pp)
@@ -895,7 +1034,7 @@ def train_ngram_lm(cfg) -> None:
     # For srilm, these are per-corpus ARPA files. For kenlm, these are
     # intermediate-file prefixes (lmplz writes <prefix>.1..N + sidecars).
     model_paths: list[str] = []
-    use_intermediate = cfg.interpolator_backend == 'kenlm'
+    use_intermediate = cfg.interpolator_backend == 'kenlm' and len(cfg.corpora) > 1
     if use_intermediate:
         model_dir = os.path.join(cfg.output_dir, 'intermediate')
     else:
@@ -931,7 +1070,7 @@ def train_ngram_lm(cfg) -> None:
             memory=cfg.memory,
             lmplz_path=cfg.lmplz_path,
             intermediate=use_intermediate,
-            discount_fallback=(cfg.lm_type == 'spelling'),
+            discount_fallback=OmegaConf.select(c, 'discount_fallback', default=cfg.lm_type == 'spelling'),
         )
         model_paths.append(out_path)
 
@@ -940,32 +1079,16 @@ def train_ngram_lm(cfg) -> None:
 
     if len(model_paths) == 1:
         log.info('Step 3: Single corpus — skipping interpolation')
-        if use_intermediate:
-            # KenLM intermediate can't be consumed by build_binary; we
-            # need an ARPA. Rebuild the single corpus as ARPA from its
-            # normalized text. arpa_path reuse is already rejected in
-            # kenlm mode, so normalized_paths[0] is guaranteed non-None.
-            log.info('  (kenlm backend) re-running lmplz to produce ARPA for downstream binary compilation')
-            c = cfg.corpora[0]
-            pruning = list(c.pruning) if OmegaConf.select(c, 'pruning') is not None else None
-            train_single_lm(
-                text_path=normalized_paths[0],
-                output_path=final_arpa,
-                order=c.order,
-                pruning=pruning,
-                memory=cfg.memory,
-                lmplz_path=cfg.lmplz_path,
-                intermediate=False,
-                discount_fallback=(cfg.lm_type == 'spelling'),
-            )
-        else:
-            shutil.copy2(model_paths[0], final_arpa)
+        shutil.copy2(model_paths[0], final_arpa)
     else:
         backend_name = cfg.interpolator_backend.upper()
         log.info(f'Step 3: Interpolating models with {backend_name}')
         raw_weights = [c.weight for c in cfg.corpora]
-        weight_sum = sum(raw_weights)
-        weights = [w / weight_sum for w in raw_weights]
+        scaled_weights = [w / max(raw_weights) for w in raw_weights]
+        weight_sum = math.fsum(scaled_weights)
+        weights = [w / weight_sum for w in scaled_weights]
+        if any(w == 0 for w in weights):
+            raise ValueError('Interpolation weight ratio is too large to represent')
         log.info(f'  Raw weights: {raw_weights} -> Normalized: {[f"{w:.4f}" for w in weights]}')
 
         if cfg.interpolator_backend == 'srilm':
@@ -988,6 +1111,9 @@ def train_ngram_lm(cfg) -> None:
             )
 
     # ---- Step 4: Compile to binary ----
+    all_vocab = arpa_vocabulary(final_arpa)
+    if cfg.lm_type == 'spelling':
+        validate_spelling_vocabulary(all_vocab, final_arpa)
     log.info('Step 4: Compiling to KenLM binary (trie format)')
     bin_path = os.path.join(cfg.output_dir, 'lm_unpruned.bin')
     compile_to_binary(final_arpa, bin_path, cfg.build_binary_path)

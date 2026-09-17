@@ -15,6 +15,7 @@ from ..flashlight_lib_text_decoder import (  # noqa  # @manual=fbcode//deeplearn
     DecodeResult,
     EmittingModelState,
     get_obj_from_emitting_model_state,
+    HotwordLM,
     LexiconDecoder,
     LexiconDecoderOptions,
     LexiconFreeDecoder,

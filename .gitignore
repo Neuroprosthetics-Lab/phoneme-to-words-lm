@@ -53,3 +53,5 @@ CMakeSettings.json
 .claude/
 CLAUDE.md
 docs/
+# Local validation outputs (may contain reference transcriptions)
+benchmark_runs/

@@ -1,13 +1,13 @@
-# Example LM decoder sweep config: Multi-objective TPE search (WER + speed)
+# Example LM decoder sweep config: Weighted single-objective TPE search (WER + speed)
 #
 # Usage:
-#   python hyperparameter_sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --devices cuda:0
+#   python sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --devices cuda:0
 #
 #   # 2 concurrent workers on GPU 0, 1 on GPU 1
-#   python hyperparameter_sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --devices cuda:0:2,cuda:1
+#   python sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --devices cuda:0:2,cuda:1
 #
 #   # Resume a previous sweep
-#   python hyperparameter_sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --resume
+#   python sweep/lm_sweep.py --sweep_config example_lm_sweep.yaml --resume
 
 study_name: "lm_decoder_sweep"
 
@@ -31,7 +31,7 @@ llm_batch_size: 100
 # ---------------------------------------------------------------------------
 # After decoding, each trial sweeps alpha values cheaply (no re-decoding)
 # to find the best interpolation between n-gram and LLM scores:
-#   final = acoustic + (lm_weight * ngram) + (alpha * llm)
+#   final = native_beam_score + alpha * llm_score
 alpha_range:
   low: 0.0
   high: 3.0
@@ -43,6 +43,10 @@ alpha_range:
 # Decode every Nth sentence (1 = all, 3 = every 3rd). Useful for faster
 # trials during initial exploration.
 eval_every_nth: 1
+max_sentences: null
+timing_warmup_sentences: 1  # excluded from timing only; all sentences count for WER
+worker_timeout_seconds: null
+seed: 42
 
 # Reorder logit columns from [BLANK, ph1..phN, SIL] to [BLANK, SIL, ph1..phN]
 # as expected by flashlight-text. Set to false if logits are already in the
@@ -60,10 +64,10 @@ output_dir: /path/to/lm_sweep_output               # <-- UPDATE THIS
 # ---------------------------------------------------------------------------
 # Objective weights (optional)
 # ---------------------------------------------------------------------------
-# Weight WER vs decode time when ranking results. Both objectives are
-# min-max normalized to [0, 1], then combined:
-#   score = wer_weight * norm_wer + time_weight * norm_time
-# Higher weight = more important. Default is equal (1.0, 1.0).
+# Raw units: WER fraction (0.01 = 1%) and mean seconds per sentence.
+#   score = wer_weight * wer + time_weight * avg_decode_time
+# No min-max normalization. Benchmark latency finalists in isolation.
+# Default weights are (1.0, 1.0).
 objective_weights:
   wer: 2.0
   time: 1.0
@@ -100,10 +104,10 @@ parameters:
     low: 10.0
     high: 60.0
 
+  # Keep the first frame per high-blank run; 1.0 is the full-CTC reference.
   blank_skip_threshold:
-    type: float_range
-    low: 0.95
-    high: 1.0
+    type: choice
+    values: [0.98, 1.0]
 
   blank_penalty:
     type: float_range
@@ -146,7 +150,7 @@ parameters:
 #       beam_size: 7000
 #       token_beam_size: 21
 #       beam_threshold: 40.0
-#       blank_skip_threshold: 0.999
+#       blank_skip_threshold: 1.0
 #       blank_penalty: 5.0
 #       temperature: 1.0
 #       lm_weight: 1.7
@@ -159,7 +163,7 @@ parameters:
 #       beam_size: 500
 #       token_beam_size: 15
 #       beam_threshold: 20.0
-#       blank_skip_threshold: 0.95
+#       blank_skip_threshold: 1.0
 #       blank_penalty: 5.0
 #       temperature: 1.0
 #       lm_weight: 2.0

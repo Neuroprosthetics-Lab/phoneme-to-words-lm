@@ -1,0 +1,73 @@
+# Run from the repository root. Change data/resource paths for your experiment.
+# One command runs screening -> full validation -> frozen development test.
+# python benchmarks/run_evaluation.py --config benchmarks/example_evaluation.yaml
+output_dir: benchmark_runs/my_evaluation
+validation_logits: /path/to/validation_logits.pkl
+test_logits: /path/to/test_logits.pkl
+
+# For one-file splitting, set test_logits: null. Repeated references stay together;
+# optional split_group: day_index also keeps recording days together.
+test_fraction: 0.2
+split_group: reference
+bootstrap_group: day_index  # use utterance for files without session/day metadata
+seed: 42
+screen_limit: 128
+validation_limit: null
+test_limit: null
+finalists: 4               # null evaluates every configuration on full validation
+bootstrap_samples: 2000
+warmup_sentences: 2
+timing_limit: 128          # same randomly selected utterances across finalists
+timing_repeats: 2
+torch_threads: 1
+worker_timeout_seconds: 1800
+reorder_logit_columns: true
+
+# 0.1 percentage-point WER improvement is worth one second at these weights.
+objective: {wer: 1000.0, latency: 1.0}
+alphas: {low: 0.0, high: 1.2, step: 0.05}
+length_penalties: [-0.25, 0.0, 0.25]
+baseline: baseline
+decoder:
+  lexicon_path: /path/to/lexicon.txt
+  tokens_path: /path/to/tokens.txt
+  kenlm_model_path: /path/to/lm_unpruned.bin
+  beam_size: 6000
+  token_beam_size: 26
+  beam_threshold: 20.0
+  n_best: 100
+  lm_weight: 1.5
+  temperature: 2.0
+  blank_penalty: 4.0
+  blank_skip_threshold: 0.98
+  do_llm_rescoring: true
+  llm_model_name: Qwen/Qwen3.5-4B
+  llm_device: cuda:0
+  llm_dtype: bfloat16
+  llm_alpha: 0.45
+  llm_length_penalty: 0.0
+  llm_prefix: "\n"
+  llm_score_eos: false
+
+# A bounded, explicit comparison set. Add/remove cases or combine overrides.
+# Scoring weights are tuned on validation for every case except the fixed baseline.
+configurations:
+  - {name: baseline, tune: false}
+  - {name: retuned}
+  - {name: beam1000, overrides: {beam_size: 1000}}
+  - {name: beam2500, overrides: {beam_size: 2500}}
+  - {name: wide_search, overrides: {beam_size: 10000, token_beam_size: 35}}
+  - {name: threshold10, overrides: {beam_threshold: 10.0}}
+  - {name: blank95, overrides: {blank_skip_threshold: 0.95}}
+  - {name: blank995, overrides: {blank_skip_threshold: 0.995}}
+  - {name: full_ctc, overrides: {blank_skip_threshold: 1.0}}
+  - {name: lm_weight11, overrides: {lm_weight: 1.1}}
+  - {name: lm_weight19, overrides: {lm_weight: 1.9}}
+  - {name: temperature15, overrides: {temperature: 1.5}}
+  - {name: blank_penalty2, overrides: {blank_penalty: 2.0}}
+  - {name: qwen2b, overrides: {llm_model_name: Qwen/Qwen3.5-2B}}
+  - {name: qwen08b, overrides: {llm_model_name: Qwen/Qwen3.5-0.8B}}
+  - {name: score_eos, overrides: {llm_score_eos: true}}
+  - {name: ngram_only, overrides: {do_llm_rescoring: false, llm_alpha: 0.0}}
+  # Uncomment to compare another KenLM binary with its matching lexicon/tokens:
+  # - {name: pruned, overrides: {kenlm_model_path: /path/to/lm_pruned.bin}}

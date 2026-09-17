@@ -6,7 +6,7 @@ output line is a single sentence.
 
 This is an offline preprocessing pipeline for training corpora — it is
 intentionally more aggressive than the runtime normalization in
-general_utils.py (which is used by real-time BCI nodes).
+phoneme_to_words_lm.utils (used by the decoder and evaluation).
 """
 
 from __future__ import annotations
@@ -19,69 +19,27 @@ import os
 import re
 import string
 import sys
-import unicodedata
 
-from num2words import num2words
 from tqdm import tqdm
 
-from phoneme_to_words_lm.utils import replace_words
+from phoneme_to_words_lm.utils import replace_words, normalize_unicode, normalize_unicode_punctuation
 
 log = logging.getLogger(__name__)
 
-# Try to load nltk sentence tokenizer at import time.
-try:
-    from nltk.tokenize import sent_tokenize as _nltk_sent_tokenize
-    # Verify the punkt_tab data is available.
-    _nltk_sent_tokenize("Test sentence.")
-    sent_tokenize = _nltk_sent_tokenize
-except LookupError:
-    import nltk
-    nltk.download('punkt_tab', quiet=True)
-    from nltk.tokenize import sent_tokenize
+def num2words(*args, **kwargs):
+    try:
+        from num2words import num2words as convert
+    except ImportError as exc:
+        raise ImportError('Raw text normalization requires num2words; install the normalization dependencies') from exc
+    return convert(*args, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# Unicode punctuation normalization
-# ---------------------------------------------------------------------------
-
-# Mapping of Unicode punctuation to ASCII equivalents.
-_UNICODE_PUNCT_MAP = str.maketrans({
-    # Smart/curly quotes -> straight
-    '\u2018': "'",   # left single
-    '\u2019': "'",   # right single
-    '\u201A': "'",   # single low-9
-    '\u201B': "'",   # single high-reversed-9
-    '\u201C': '"',   # left double
-    '\u201D': '"',   # right double
-    '\u201E': '"',   # double low-9
-    '\u201F': '"',   # double high-reversed-9
-    '\u2039': "'",   # single left-pointing angle
-    '\u203A': "'",   # single right-pointing angle
-    '\u00AB': '"',   # left-pointing double angle (guillemet)
-    '\u00BB': '"',   # right-pointing double angle (guillemet)
-
-    # Dashes -> space (word boundaries)
-    '\u2013': ' ',   # en dash
-    '\u2014': ' ',   # em dash
-    '\u2015': ' ',   # horizontal bar
-
-    # Ellipsis -> period (for sentence splitting)
-    '\u2026': '.',
-
-    # Other common Unicode punctuation
-    '\u2032': "'",   # prime
-    '\u2033': '"',   # double prime
-    '\u00B7': ' ',   # middle dot
-    '\u2022': ' ',   # bullet
-    '\u2010': '-',   # hyphen
-    '\u2011': '-',   # non-breaking hyphen
-    '\u2012': '-',   # figure dash
-})
-
-
-def normalize_unicode_punctuation(text: str) -> str:
-    """Replace Unicode punctuation with ASCII equivalents."""
-    return text.translate(_UNICODE_PUNCT_MAP)
+def sent_tokenize(text):
+    from nltk.tokenize import sent_tokenize as tokenize
+    try:
+        return tokenize(text)
+    except LookupError as exc:
+        raise LookupError('Raw text normalization requires NLTK punkt_tab data; run python -m nltk.downloader punkt_tab') from exc
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +78,8 @@ _DECADE_RE = re.compile(r'\b(\d{4})s\b')
 def _ordinal_words_cached(digits: str) -> str | None:
     try:
         return num2words(int(digits), to='ordinal')
+    except ImportError:
+        raise
     except Exception:
         return None
 
@@ -131,6 +91,8 @@ def _decade_words_cached(digits: str) -> str | None:
         last = parts[-1]
         parts[-1] = last[:-1] + 'ies' if last.endswith('y') else last + 's'
         return ' '.join(parts)
+    except ImportError:
+        raise
     except Exception:
         return None
 
@@ -175,6 +137,8 @@ def _number_words_cached(raw: str) -> str | None:
         # num2words produces hyphens ("forty-two") and commas
         # ("one thousand, two hundred") — clean them out.
         return words.replace('-', ' ').replace(',', '')
+    except ImportError:
+        raise
     except Exception:
         return None
 
@@ -191,24 +155,6 @@ def numbers_to_words(text: str) -> str:
         words = _number_words_cached(match.group())
         return words if words is not None else match.group()
     return _NUMBER_RE.sub(_replace, text)
-
-
-# ---------------------------------------------------------------------------
-# Unicode normalization (strip accents)
-# ---------------------------------------------------------------------------
-
-def normalize_unicode(text: str) -> str:
-    """NFKD-normalize text and drop anything outside ASCII.
-
-    'cafe\\u0301' -> 'cafe', 'nai\\u0308ve' -> 'naive'. Combining marks
-    split off by NFKD (accents/diacritics) are non-ASCII and get dropped.
-    Non-Latin scripts (Greek, CJK, ...) and atomic non-decomposable chars
-    like 'ß' are also dropped here — they would be stripped one step later
-    by `remove_punctuation`'s `[a-zA-Z '\\s]` filter anyway, so removing
-    them up front is equivalent and ~14× faster than the pure-Python
-    `unicodedata.category`-per-char scan this replaced.
-    """
-    return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +338,9 @@ def _normalize_chunk_spelling(chunk: list[bytes]) -> tuple[set[str], int]:
         line = raw.decode('utf-8', errors='replace')
         for sentence in normalize_lines(line):
             for word in sentence.split():
-                seen.add(' '.join(word))
+                word = word.replace("'", '')  # Apostrophes have no spoken-letter entry.
+                if word:
+                    seen.add(' '.join(word))
     return seen, nbytes
 
 
@@ -434,6 +382,9 @@ def normalize_corpus(
         For word mode: set of all unique words found in the normalized corpus.
         For spelling mode: empty set (vocab comes from the letter lexicon).
     """
+    # Fail in the parent, before opening/truncating output or starting workers.
+    num2words(0)
+    sent_tokenize('Dependency check.')
     vocab: set[str] = set()
     n_out = 0
 

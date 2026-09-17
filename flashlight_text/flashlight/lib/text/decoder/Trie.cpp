@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -79,7 +80,11 @@ double TrieLogAdd(double log_a, double log_b) {
 void smearNode(TrieNodePtr node, SmearingMode smearMode) {
   node->maxScore = -std::numeric_limits<float>::infinity();
   for (auto score : node->scores) {
-    node->maxScore = TrieLogAdd(node->maxScore, score);
+    if (smearMode == SmearingMode::MAX) {
+      node->maxScore = std::max(node->maxScore, score);
+    } else {
+      node->maxScore = TrieLogAdd(node->maxScore, score);
+    }
   }
   for (auto child : node->children) {
     auto childNode = child.second;

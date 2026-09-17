@@ -20,13 +20,14 @@ def _build_grid_search_space(parameters):
         if ptype == "choice":
             search_space[name] = [json.dumps(list(v)) if OmegaConf.is_list(v) else v for v in spec["values"]]
         elif ptype == "fixed":
-            search_space[name] = [spec["value"]]
+            continue  # Applied directly; never a sampled grid dimension.
         elif ptype == "float_range":
             low, high = spec["low"], spec["high"]
             step = spec.get("step", None)
             if step is not None:
                 # Use step to generate discrete grid points
-                search_space[name] = list(np.arange(low, high + step / 2, step))
+                count = int(np.floor((high-low)/step + 1e-10)) + 1
+                search_space[name] = [float(low+i*step) for i in range(count)]
             else:
                 n_pts = spec.get("n_grid_points", 5)
                 if spec.get("log", False):
@@ -41,7 +42,7 @@ def _build_grid_search_space(parameters):
                 search_space[name] = list(range(low, high + 1, step))
             elif n_pts is not None:
                 import math
-                step = max(1, math.ceil((high - low) / (n_pts - 1)))
+                step = max(1, math.ceil((high - low) / max(1, n_pts - 1)))
                 search_space[name] = list(range(low, high + 1, step))
             else:
                 search_space[name] = list(range(low, high + 1))
@@ -118,7 +119,9 @@ def encode_param_value(name: str, spec, value):
         return ival, False
 
     elif ptype == "boolean":
-        return bool(value), False
+        if not isinstance(value, bool):
+            raise ValueError(f'{name} requires a boolean initial value')
+        return value, False
 
     else:
         raise ValueError(f"Unknown param type '{ptype}' for param '{name}'")
@@ -183,7 +186,7 @@ def suggest_param(trial, name: str, spec):
             raise ValueError(f"Parameter '{name}': 'step' and 'log' cannot both be set for float_range")
         return trial.suggest_float(name, spec["low"], spec["high"], step=step, log=log)
     elif ptype == "int_range":
-        return trial.suggest_int(name, spec["low"], spec["high"], step=spec.get("step", 1))
+        return trial.suggest_int(name, spec["low"], spec["high"], step=spec.get("step", 1), log=spec.get("log", False))
     elif ptype == "boolean":
         return trial.suggest_categorical(name, [False, True])
     else:

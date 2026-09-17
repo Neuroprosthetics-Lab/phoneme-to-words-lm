@@ -6,6 +6,7 @@ target_sources(
   flashlight-text
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/ConvLM.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/HotwordLM.cpp
   ${CMAKE_CURRENT_LIST_DIR}/ZeroLM.cpp
   )
 
