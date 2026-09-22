@@ -535,14 +535,13 @@ class KenLMFlashlightTextLM:
 
         Args:
             results: Raw flashlight decode results (list of DecodeResult objects).
-            n_best: Maximum number of hypotheses to keep.
+            n_best: Maximum number of unique, nonempty normalized hypotheses to keep.
             lm_weight: Weight on n-gram LM scores for combined scoring.
 
         Returns:
             Hypothesis dict with 'word_seqs', 'ngram_scores', 'acoustic_scores',
             and 'final_scores', all sorted best-first.
         """
-        results = results[:n_best]
 
         word_seqs = []
         seen = set()
@@ -560,6 +559,9 @@ class KenLMFlashlightTextLM:
             word_seqs.append(word_seq)
             ngram_scores.append(result.lmScore)
             acoustic_scores.append(result.emittingModelScore)
+            # Duplicates and empty results must not consume the n-best budget.
+            if len(word_seqs) >= n_best:
+                break
 
         if not word_seqs:
             return {
@@ -687,7 +689,8 @@ class KenLMFlashlightTextLM:
         offsets = []  # (start, end) per hypo, or None if empty
         for idx, hypo in enumerate(hypotheses):
             ctx = contexts[idx] if contexts is not None else ""
-            if hypo['word_seqs']:
+            # Empty decodes use ['']; skip them to avoid zero-token LLM inputs.
+            if any(seq.strip() for seq in hypo['word_seqs']):
                 start = len(all_seqs)
                 all_seqs.extend(hypo['word_seqs'])
                 all_contexts.extend([ctx] * len(hypo['word_seqs']))
