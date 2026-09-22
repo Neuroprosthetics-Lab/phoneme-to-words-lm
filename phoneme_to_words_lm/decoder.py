@@ -939,6 +939,10 @@ def _load_hotwords_from_file(path: str) -> Dict[str, float]:
 # *which paths survive the beam* during partial-word traversal.
 TRIE_HOTWORD_BIAS = 5.0
 
+# Number of scored token positions whose full-vocab log-probs are materialized
+# in fp32 at once during LLM rescoring (bounds GPU memory; ~250 MB for Qwen3.5).
+LLM_LOGPROB_CHUNK = 256
+
 
 def _construct_trie(tokens_dict, word_dict, lexicon, lm, silence, hotword_idx_set=None):
     """Build a flashlight Trie from the lexicon, seeded with unigram LM scores.
@@ -1028,18 +1032,22 @@ def _get_llm_scores(
     An attention mask ensures that padding tokens do not contribute to
     the score.
 
-    When *contexts* is provided, each context string is prepended to its
-    corresponding hypothesis so that the LLM conditions on the context.
-    Only the hypothesis tokens are scored — context tokens serve purely
-    as conditioning and do not contribute to the returned score.
+    Each hypothesis is followed by a newline, which acts as an
+    end-of-sentence marker and is scored too, so the LLM can penalise
+    hypotheses that stop mid-sentence.
+
+    When *contexts* is provided, each context string plus a newline is
+    prepended to its corresponding hypothesis so that the LLM conditions
+    on the context. Only the hypothesis tokens are scored — context tokens
+    serve purely as conditioning and do not contribute to the returned score.
 
     Args:
         model: A causal LM returned by :func:`_build_llm`.
         tokenizer: The matching tokenizer returned by :func:`_build_llm`.
         hypotheses: Candidate sentence strings to score.
         length_penalty: If non-zero, subtract ``length_penalty * n_tokens``
-            from each score to penalise longer sequences.  When *contexts*
-            is provided, only hypothesis tokens count toward the length.
+            from each score to penalise longer sequences. Only scored
+            hypothesis tokens (including the end-of-sentence newline) count.
         contexts: Optional list of context strings, one per hypothesis.
             Each context is prepended to its hypothesis before scoring.
             Pass *None* or a list of empty strings to disable.
@@ -1050,46 +1058,30 @@ def _get_llm_scores(
     if not hypotheses:
         return []
 
-    has_context = contexts is not None and any(c for c in contexts)
+    if contexts is None:
+        contexts = [''] * len(hypotheses)
 
-    if not has_context:
-        # --- Fast path: no context (original behaviour) ---
-        inputs = tokenizer(hypotheses, return_tensors='pt', padding=True)
-        input_ids = inputs['input_ids'].to(model.device)
-        attention_mask = inputs['attention_mask'].to(model.device)
-
-        with torch.inference_mode():
-            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-            log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
-
-            # Shift: logits at position t predict token at position t+1
-            token_log_probs = log_probs[:, :-1, :].gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
-
-            # Masked sum over real (non-padding) tokens
-            scores = (token_log_probs * attention_mask[:, 1:]).sum(dim=-1)
-
-            if length_penalty != 0.0:
-                scores = scores - length_penalty * attention_mask.sum(dim=-1)
-
-        return scores.tolist()
-
-    # --- Context path: prepend context, score only hypothesis tokens ---
-
-    # Detect whether the tokenizer normally adds a BOS token so the
-    # context path produces the same leading-token behaviour as the
-    # fast path (which uses tokenizer(...) with default settings).
-    adds_bos = getattr(tokenizer, 'add_bos_token', False)
-    bos_prefix = [tokenizer.bos_token_id] if adds_bos else []
+    # Logits at position t predict token t+1, so the first input token is never
+    # scored. Always prepend at least one conditioning token (BOS, or "\n" for
+    # tokenizers like Qwen that have no BOS) so the first hypothesis token gets
+    # a real log-prob. Without this, one-token hypotheses ("yes"/"no") score 0.
+    if tokenizer.bos_token_id is not None:
+        bos_prefix = [tokenizer.bos_token_id]
+    else:
+        bos_prefix = tokenizer.encode('\n', add_special_tokens=False)
 
     pad_id = tokenizer.pad_token_id
     full_id_lists = []
     ctx_lens = []  # number of tokens to exclude from scoring per item
 
     for ctx, hyp in zip(contexts, hypotheses):
-        if ctx and not ctx[-1].isspace():
-            ctx = ctx + " "
+        # Context and hypothesis are separated by a newline (one sentence per
+        # line). "\n" is a clean token boundary, so encoding the two parts
+        # separately gives the same tokens as encoding the joined string. The
+        # hypothesis' trailing "\n" is scored as an end-of-sentence marker.
+        ctx = ctx.rstrip() + "\n" if ctx.strip() else ""
         c_ids = tokenizer.encode(ctx, add_special_tokens=False) if ctx else []
-        h_ids = tokenizer.encode(hyp, add_special_tokens=False)
+        h_ids = tokenizer.encode(hyp + "\n", add_special_tokens=False)
         full_id_lists.append(bos_prefix + c_ids + h_ids)
         ctx_lens.append(len(bos_prefix) + len(c_ids))
 
@@ -1106,22 +1098,29 @@ def _get_llm_scores(
     ctx_lens_t = torch.tensor(ctx_lens, dtype=torch.long, device=model.device)
 
     with torch.inference_mode():
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
-
-        # Shift: position t predicts token at t+1
-        token_log_probs = log_probs[:, :-1, :].gather(
-            2, input_ids[:, 1:].unsqueeze(-1)
-        ).squeeze(-1)
+        # Keep logits in the model dtype (bf16); upcasting the full (B, T, vocab)
+        # tensor and log-softmaxing it costs ~8 extra bytes per entry.
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
 
         # Hypothesis-only mask: the predicted token at shifted position t
         # is input_ids[:, t+1], which belongs to the hypothesis when
         # t+1 >= ctx_len.
         positions = torch.arange(max_len - 1, device=model.device).unsqueeze(0)
-        hyp_mask = ((positions + 1) >= ctx_lens_t.unsqueeze(1)).float()
-        hyp_mask = hyp_mask * attention_mask[:, 1:].float()
+        hyp_mask = ((positions + 1) >= ctx_lens_t.unsqueeze(1)) & attention_mask[:, 1:].bool()
 
-        scores = (token_log_probs * hyp_mask).sum(dim=-1)
+        # Compute log-probs only at scored positions, in fp32 chunks, so memory
+        # scales with LLM_LOGPROB_CHUNK rather than batch * seq_len * vocab.
+        # Shift: position t predicts token at t+1.
+        rows, pos = hyp_mask.nonzero(as_tuple=True)
+        targets = input_ids[rows, pos + 1]
+        token_log_probs = torch.empty(len(rows), dtype=torch.float32, device=model.device)
+        for i in range(0, len(rows), LLM_LOGPROB_CHUNK):
+            j = i + LLM_LOGPROB_CHUNK
+            chunk = logits[rows[i:j], pos[i:j]].float()
+            token_log_probs[i:j] = chunk.gather(-1, targets[i:j, None]).squeeze(-1) - chunk.logsumexp(dim=-1)
+
+        scores = torch.zeros(len(full_id_lists), dtype=torch.float32, device=model.device)
+        scores.index_add_(0, rows, token_log_probs)
 
         if length_penalty != 0.0:
             scores = scores - length_penalty * hyp_mask.sum(dim=-1)

@@ -49,6 +49,23 @@ def preprocess_sentences(sentences: List[str]) -> List[str]:
     return processed
 
 
+def format_for_llm_scoring(sentence: str, tokenizer) -> str:
+    """Format a sentence exactly as the LLM rescorer (``_get_llm_scores`` in decoder.py) scores it.
+
+    The rescorer conditions each hypothesis on one leading token (the tokenizer's BOS,
+    or "\\n" for tokenizers like Qwen that have none) and scores a trailing "\\n" as the
+    end-of-sentence marker. Train and evaluate on the same format so the LoRA learns
+    what the rescorer actually measures.
+    """
+    if tokenizer.bos_token_id is None:
+        prefix = '\n'                   # e.g. Qwen
+    elif tokenizer('x')['input_ids'][:1] == [tokenizer.bos_token_id]:
+        prefix = ''                     # tokenizer adds BOS itself (e.g. Llama)
+    else:
+        prefix = tokenizer.bos_token    # BOS defined but not auto-added (e.g. gpt2)
+    return prefix + sentence + '\n'
+
+
 def prepare_dataset(
     source_files: dict,
     upsample_factors: dict,
@@ -132,7 +149,7 @@ def compute_perplexity(
     total_tokens = 0
 
     for i in tqdm(range(0, len(sentences), batch_size), desc=desc):
-        batch = sentences[i:i + batch_size]
+        batch = [format_for_llm_scoring(s, tokenizer) for s in sentences[i:i + batch_size]]
 
         inputs = tokenizer(
             batch,
@@ -314,7 +331,9 @@ def main():
 
     # ---- Dataset ----
     def formatting_func(example):
-        return {"text": example["text"] + tokenizer.eos_token}
+        # match the rescoring format; the scored end marker is the trailing "\n" (an EOS the
+        # trainer may append after it is never scored by the rescorer, so it is harmless)
+        return {"text": format_for_llm_scoring(example["text"], tokenizer)}
 
     train_ds = Dataset.from_dict({"text": train_sentences})
     train_ds = train_ds.map(formatting_func)

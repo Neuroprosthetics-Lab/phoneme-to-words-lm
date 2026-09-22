@@ -162,6 +162,8 @@ final_score = acoustic_score + (lm_weight * ngram_score) + (llm_alpha * llm_scor
 
 Rescore the n-best beam search hypotheses with a causal LLM. Each candidate is preprocessed (punctuation removal, word replacement), batch-scored by the LLM (sum of per-token log-probabilities, with optional `llm_length_penalty`), and combined with the beam score: `beam_score + llm_alpha * llm_score`.
 
+Each candidate is scored as one line of text: it is preceded by a conditioning token (the tokenizer's BOS, or `\n` for tokenizers such as Qwen that have none) so its first word is scored, and followed by a `\n` that is also scored as an end-of-sentence marker, which lets the LLM penalise candidates that stop mid-sentence. Log-probs are computed only at scored positions, in fp32 chunks, so GPU memory is dominated by the model's own logits (`llm_batch_size` × sequence length × vocab, in the model dtype).
+
 The LLM is loaded via HuggingFace `transformers`. Default is **Qwen3.5-4B** (~8-10 GB in bfloat16); swap in any causal LM.
 
 ```python
@@ -180,7 +182,7 @@ decoder = KenLMFlashlightTextLM(
 
 ## Contextual Rescoring
 
-Pass context strings (previous sentences, domain hints, keywords, etc.) to condition the LLM during rescoring. Context is prepended to each n-best hypothesis (only the hypothesis tokens are scored) and applied only at the LLM stage, not the n-gram beam search.
+Pass context strings (previous sentences, domain hints, keywords, etc.) to condition the LLM during rescoring. Context is prepended to each n-best hypothesis on its own line, i.e. `context + "\n" + hypothesis` (trailing whitespace on the context is stripped; only the hypothesis tokens are scored) and applied only at the LLM stage, not the n-gram beam search.
 
 ### Offline decoding with context
 
@@ -214,11 +216,11 @@ for utterance_logits in utterance_stream:
 
 ### Example context formats
 
-The LLM sees raw text, so any sensible English prefix works — previous sentences, a `domain: cooking\n` hint, a `keywords: ...\n` line, multi-turn dialogue, or a combination:
+The LLM sees raw text, so any sensible English prefix works — previous sentences, a `domain: cooking` hint, a `keywords: ...` line, multi-turn dialogue, or a combination. The hypothesis always starts on a new line after the context, so write the context as complete lines (don't end it with an inline prompt like `current: `):
 
 ```python
-context = "previous: i need two cups of flour\ncurrent: "
-context = "domain: cooking\nkeywords: flour oven baking\n"
+context = "i need two cups of flour"
+context = "domain: cooking\nkeywords: flour oven baking"
 ```
 
 The base LLM uses context without retraining; LoRA-finetuning on context-prefixed pairs improves utilization further. Keep contexts to a few recent sentences — long contexts grow memory and latency.
